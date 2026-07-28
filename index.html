@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Goods Sort Challenge</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Nunito:wght@600;700;800&family=Outfit:wght@500;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark">GS</span>
+          <div>
+            <h1>Goods Sort</h1>
+            <p>限时货架三消</p>
+          </div>
+        </div>
+        <div class="stats">
+          <div class="stat">
+            <span class="stat-label">层数</span>
+            <strong id="layerLabel">0</strong>
+          </div>
+          <div class="stat timer-stat">
+            <span class="stat-label">时间</span>
+            <strong id="timerLabel">90</strong>
+          </div>
+          <div class="stat">
+            <span class="stat-label">连消</span>
+            <strong id="comboLabel">0</strong>
+          </div>
+        </div>
+      </header>
+
+      <main class="stage">
+        <div id="board" class="board" aria-label="货架棋盘"></div>
+        <p id="hint" class="hint">三格可拖放；单格只出不进；⭐999 单击消除</p>
+      </main>
+
+      <footer class="dock">
+        <button class="booster" id="btnFreeze" type="button" title="冻结时间">
+          <span class="booster-icon">❄️</span>
+          <span class="booster-name">冻结</span>
+          <span class="booster-count" id="freezeCount">2</span>
+        </button>
+        <button class="booster" id="btnShuffle" type="button" title="打乱最外层">
+          <span class="booster-icon">🔀</span>
+          <span class="booster-name">重排</span>
+          <span class="booster-count" id="shuffleCount">1</span>
+        </button>
+        <button class="booster" id="btnHammer" type="button" title="敲掉一个物品">
+          <span class="booster-icon">🔨</span>
+          <span class="booster-name">锤子</span>
+          <span class="booster-count" id="hammerCount">1</span>
+        </button>
+        <button class="ghost-btn" id="btnRestart" type="button">重开</button>
+      </footer>
+
+      <section class="level-panel">
+        <div class="level-panel-head">
+          <div>
+            <h2>关卡数据</h2>
+            <p>支持 1/3 格货架；单格只出不进；999 单击消除</p>
+          </div>
+          <div class="level-panel-actions">
+            <button class="ghost-btn" id="btnSample" type="button">填入示例</button>
+            <label class="trials-label" for="analyzeTrials">
+              模拟局数
+              <input
+                id="analyzeTrials"
+                class="trials-input"
+                type="number"
+                min="10"
+                max="50000"
+                step="10"
+                value="120"
+              />
+            </label>
+            <button class="ghost-btn" id="btnAnalyze" type="button">分析难度</button>
+            <button class="primary-btn" id="btnLoadLevel" type="button">加载关卡</button>
+          </div>
+        </div>
+        <textarea
+          id="levelInput"
+          class="level-input"
+          spellcheck="false"
+          placeholder='[[[108,20,3],[0,0,15]],[[30,20,0],[44,0,44]],...]'
+        ></textarea>
+        <p id="levelError" class="level-error" hidden></p>
+        <div id="analyzeResult" class="analyze-result" hidden></div>
+      </section>
+
+      <section class="batch-panel">
+        <div class="level-panel-head">
+          <div>
+            <h2>批量关卡模拟</h2>
+            <p>拖入 Excel（含「物品数据 / itemData」）。每关默认模拟 20 局，结果写回对应行并可下载。</p>
+          </div>
+          <div class="level-panel-actions">
+            <label class="trials-label" for="batchTrials">
+              每关局数
+              <input
+                id="batchTrials"
+                class="trials-input"
+                type="number"
+                min="5"
+                max="500"
+                step="5"
+                value="20"
+              />
+            </label>
+            <button class="primary-btn" id="btnBatchStart" type="button" disabled>开始批量模拟</button>
+            <button class="ghost-btn" id="btnBatchStop" type="button" disabled>停止</button>
+            <button class="ghost-btn" id="btnBatchDownload" type="button" disabled>下载结果表</button>
+          </div>
+        </div>
+
+        <div id="batchDrop" class="batch-drop" tabindex="0">
+          <strong>拖拽 .xlsx 到此处</strong>
+          <span>或点击选择文件</span>
+          <input id="batchFile" type="file" accept=".xlsx,.xls" hidden />
+        </div>
+        <p id="batchStatus" class="batch-status">等待上传表格…</p>
+        <div id="batchProgress" class="analyze-progress" hidden>
+          <div class="analyze-progress-bar" aria-hidden="true">
+            <span id="batchProgressBar" style="width:0%"></span>
+          </div>
+        </div>
+        <div id="batchTableWrap" class="batch-table-wrap" hidden>
+          <table id="batchTable" class="batch-table"></table>
+        </div>
+      </section>
+    </div>
+
+    <div id="overlay" class="overlay hidden" role="dialog" aria-modal="true">
+      <div class="modal">
+        <p class="modal-kicker" id="modalKicker">准备开始</p>
+        <h2 id="modalTitle">Goods Sort Challenge</h2>
+        <p id="modalText">加载关卡数据后开始。只能操作最外层，凑齐三个相同即可消除。</p>
+        <div class="modal-actions">
+          <button class="primary-btn" id="modalPrimary" type="button">开始游戏</button>
+          <button class="ghost-btn hidden" id="modalSecondary" type="button">再试一次</button>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="game.js?v=20260728"></script>
+    <script type="module" src="batch.js?v=20260728"></script>
+  </body>
+</html>

@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>1.0.23 关卡贡献拆解</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --surface: #171a21;
+      --surface-2: #1e232c;
+      --border: #2a3140;
+      --text: #e8eaed;
+      --muted: #9aa3b2;
+      --accent: #6ea8fe;
+      --success: #3dd68c;
+      --warning: #f5a524;
+      --danger: #f31260;
+      --info: #3b82f6;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "SF Pro Text", "PingFang SC", "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.55;
+      padding: 32px 20px 64px;
+    }
+    .wrap { max-width: 1100px; margin: 0 auto; }
+    h1 { font-size: 28px; margin: 0 0 6px; font-weight: 650; letter-spacing: -0.02em; }
+    h2 { font-size: 20px; margin: 36px 0 12px; font-weight: 600; }
+    h3 { font-size: 16px; margin: 24px 0 10px; font-weight: 600; color: var(--text); }
+    .sub { color: var(--muted); font-size: 14px; margin-bottom: 20px; }
+    .muted { color: var(--muted); font-size: 13px; }
+    .grid { display: grid; gap: 12px; }
+    .grid-3 { grid-template-columns: repeat(3, 1fr); }
+    .grid-2 { grid-template-columns: 1.25fr 1fr; gap: 16px; }
+    @media (max-width: 860px) {
+      .grid-3, .grid-2 { grid-template-columns: 1fr; }
+    }
+    .stat, .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+    }
+    .stat .value { font-size: 20px; font-weight: 650; color: var(--success); }
+    .stat .label { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .card h4 { margin: 0 0 10px; font-size: 14px; font-weight: 600; }
+    .row { display: flex; justify-content: space-between; gap: 12px; margin: 6px 0; font-size: 14px; }
+    .callout {
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin: 14px 0;
+      border: 1px solid var(--border);
+      background: var(--surface-2);
+      font-size: 14px;
+    }
+    .callout strong { display: block; margin-bottom: 4px; }
+    .callout.warn { border-color: #5a4218; background: #1f1a10; }
+    .callout.warn strong { color: var(--warning); }
+    .callout.info { border-color: #1e3a5f; background: #121a26; }
+    .callout.info strong { color: var(--accent); }
+    .callout.danger { border-color: #5a2038; background: #1f1218; }
+    .callout.danger strong { color: var(--danger); }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 500; background: var(--surface-2); }
+    tr:last-child td { border-bottom: none; }
+    tr.changed td { background: rgba(59, 130, 246, 0.08); }
+    .pill {
+      display: inline-block;
+      font-size: 12px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: var(--accent);
+      margin-right: 8px;
+      white-space: nowrap;
+    }
+    .combo { display: flex; align-items: center; margin: 8px 0; font-size: 14px; }
+    .bars { display: flex; flex-direction: column; gap: 8px; padding: 8px 0; }
+    .bar-row { display: grid; grid-template-columns: 52px 1fr 48px; gap: 8px; align-items: center; font-size: 12px; }
+    .bar-track { height: 10px; background: #252b36; border-radius: 999px; overflow: hidden; }
+    .bar-fill { height: 100%; border-radius: 999px; background: var(--success); }
+    .bar-fill.info { background: var(--info); }
+    .bar-fill.accent { background: var(--accent); }
+    .group-bars { display: grid; gap: 10px; }
+    .group-item { display: grid; grid-template-columns: 72px 1fr; gap: 10px; align-items: center; font-size: 12px; }
+    .twin { display: flex; flex-direction: column; gap: 4px; }
+    .twin .bar-track { height: 8px; }
+    .legend { display: flex; gap: 16px; font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+    .dot.a { background: #8b93a7; }
+    .dot.b { background: var(--accent); }
+    hr { border: none; border-top: 1px solid var(--border); margin: 28px 0; }
+    .proof-table td:nth-child(n+2) { font-variant-numeric: tabular-nums; }
+    footer { margin-top: 28px; color: var(--muted); font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>1.0.23 关卡贡献拆解</h1>
+    <p class="sub">对比 1.0.20 → 1.0.23 · 时间 2026-07-24 至 07-25 · 按 gn_c_level 聚合 · 濒死 = 人均卡死 + 人均超时</p>
+
+    <div class="grid grid-3">
+      <div class="stat">
+        <div class="value">80.36% → 82.84%</div>
+        <div class="label">关内胜率 · +2.48pp</div>
+      </div>
+      <div class="stat">
+        <div class="value">0.418 → 0.350</div>
+        <div class="label">人均濒死（卡死+超时） · −0.068</div>
+      </div>
+      <div class="stat">
+        <div class="value">0.201 → 0.177</div>
+        <div class="label">人均复活次数 · −0.025</div>
+      </div>
+    </div>
+
+    <div class="callout warn">
+      <strong>先看结论：三类指标驱动机制不同</strong>
+      胜率提升约一半来自关卡本身变易（难度效应 +1.33pp），一半来自流量更集中在 1–50 关（结构效应 +1.24pp）。濒死下降以结构效应为主（−0.057 / 总 −0.068）。复活整体下降几乎全部由流量结构驱动（结构 −0.034）；共有关卡难度效应反而推高复活（+0.009）——只有部分高难关真正降了复活。
+    </div>
+
+    <h2>结构 vs 难度分解</h2>
+    <div class="grid grid-3">
+      <div class="card">
+        <h4>胜率 (+2.48pp)</h4>
+        <div class="row"><span>结构（流量 mix）</span><strong>+1.24pp</strong></div>
+        <div class="row"><span>难度（同关卡 rate）</span><strong>+1.33pp</strong></div>
+        <p class="muted">1–50 关开局占比 23.4% → 33.1%，且这些关胜率普遍上升</p>
+      </div>
+      <div class="card">
+        <h4>人均濒死 (−0.068)</h4>
+        <div class="row"><span>结构</span><strong>−0.057</strong></div>
+        <div class="row"><span>难度</span><strong>−0.011</strong></div>
+        <p class="muted">卡死约 −0.041、超时约 −0.027；结构占大头</p>
+      </div>
+      <div class="card">
+        <h4>人均复活 (−0.025)</h4>
+        <div class="row"><span>结构</span><strong>−0.034</strong></div>
+        <div class="row"><span>难度</span><strong>+0.009（变差）</strong></div>
+        <p class="muted">整体下降靠前期流量变重；多数共有关卡复活率并未下降</p>
+      </div>
+    </div>
+
+    <h2>开局流量按 level_no 分布（结构效应来源）</h2>
+    <div class="card">
+      <div class="legend">
+        <span><i class="dot a"></i>1.0.20 开局占比 (%)</span>
+        <span><i class="dot b"></i>1.0.23 开局占比 (%)</span>
+      </div>
+      <div class="group-bars" id="traffic-bars"></div>
+      <p class="muted" style="margin-top:10px">Source: 关卡 unique 全量 · 2026-07-24~25 · 纵轴为该段开局用户占版本总开局的百分比</p>
+    </div>
+
+    <h2>如何证明：复活↓ 由「挤在前期低复活关」驱动</h2>
+    <div class="callout info">
+      <strong>证明链条</strong>
+      ① 流量更挤前期 → ② 前期本来就少复活（用 1.0.20 作基线）→ ③ 反事实：只换流量结构就会下降，只换关卡难度反而上升。
+    </div>
+
+    <h3>① 流量占比变化</h3>
+    <table class="proof-table">
+      <thead>
+        <tr><th>关卡段</th><th>1.0.20 占比</th><th>1.0.23 占比</th><th>变化</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>1–50</td><td>23.4%</td><td>33.1%</td><td>+9.7pp</td></tr>
+        <tr><td>≤100</td><td>35.3%</td><td>44.5%</td><td>+9.2pp</td></tr>
+        <tr><td>≤200</td><td>51.0%</td><td>58.0%</td><td>+7.1pp</td></tr>
+        <tr><td>501–1000</td><td>18.1%</td><td>14.8%</td><td>−3.3pp</td></tr>
+        <tr><td>1000+</td><td>5.7%</td><td>5.1%</td><td>−0.6pp</td></tr>
+      </tbody>
+    </table>
+
+    <h3>② 前期本来少复活（1.0.20 基线）</h3>
+    <table class="proof-table">
+      <thead>
+        <tr><th>关卡段</th><th>1.0.20 人均复活</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>1–50</td><td>0.024</td></tr>
+        <tr><td>51–100</td><td>0.083</td></tr>
+        <tr><td>101–200</td><td>0.110</td></tr>
+        <tr><td>201–500</td><td>0.119</td></tr>
+        <tr><td>501–1000</td><td>0.397</td></tr>
+        <tr><td>1000+</td><td>1.174</td></tr>
+      </tbody>
+    </table>
+    <p class="muted">按 1.0.20 复活五分位：Q1（最低复活）流量占比 44.4% → 51.1%；Q5（最高复活）4.8% → 3.8%。</p>
+
+    <h3>③ 反事实分解</h3>
+    <table class="proof-table">
+      <thead>
+        <tr><th>情景</th><th>人均复活</th><th>vs 1.0.20</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>实际 1.0.20</td><td>0.201</td><td>—</td></tr>
+        <tr><td>实际 1.0.23</td><td>0.177</td><td>−0.025</td></tr>
+        <tr><td>反事实：1.0.23 流量 × 1.0.20 各关复活率</td><td>0.169</td><td>−0.032</td></tr>
+        <tr><td>反事实：1.0.20 流量 × 1.0.23 各关复活率</td><td>0.212</td><td>+0.011</td></tr>
+      </tbody>
+    </table>
+    <p class="muted">只换流量结构即可解释（甚至超过）整体下降；只换难度反而推高复活。</p>
+
+    <hr />
+
+    <h2>真正「关卡变易」的 gn_c_level（难度效应）</h2>
+    <p class="muted">贡献 = 两版本平均流量份额 × 指标变化。过滤：两版本开局用户数均 ≥ 100（共 1178 关）。bp = 百分点的百分之一；‰ = 千分点。高亮行表示 level_ver 有变化。</p>
+
+    <h3>胜率提升贡献 Top 关卡</h3>
+    <div class="grid grid-2">
+      <table>
+        <thead>
+          <tr><th>gn_c_level</th><th>level_no</th><th>胜率 20→23</th><th>Δ</th><th>贡献</th><th>改版</th></tr>
+        </thead>
+        <tbody id="win-table"></tbody>
+      </table>
+      <div class="card">
+        <div class="muted" style="margin-bottom:8px">对整体胜率的难度贡献 (bp)</div>
+        <div class="bars" id="win-bars"></div>
+        <div class="callout info" style="margin-top:12px">
+          <strong>胜率主因集中在前期</strong>
+          Top12 几乎全是 gn ≤ 59。最大单关：40 / 48 / 59（单关胜率 +7pp 级），加上高流量关 1 / 10 / 19。
+        </div>
+      </div>
+    </div>
+
+    <h3>濒死下降贡献 Top 关卡</h3>
+    <div class="grid grid-2">
+      <table>
+        <thead>
+          <tr><th>gn_c_level</th><th>level_no</th><th>人均濒死 20→23</th><th>Δ</th><th>贡献</th><th>改版</th></tr>
+        </thead>
+        <tbody id="near-table"></tbody>
+      </table>
+      <div class="card">
+        <div class="muted" style="margin-bottom:8px">对整体濒死率下降的难度贡献 (‰)</div>
+        <div class="bars" id="near-bars"></div>
+        <div class="callout info" style="margin-top:12px">
+          <strong>两类关卡</strong>
+          ① 前期高量关 40 / 59 / 48 / 90 / 80：单关降幅中等但流量大。② 超难关 1227 / 1187 / 1156 / 1169：人均濒死从两位数降到仍很高，但斜率极大。
+        </div>
+      </div>
+    </div>
+
+    <h3>复活下降（难度效应）Top 关卡</h3>
+    <div class="callout danger">
+      <strong>注意：整体复活↓ 主要不是这些关「拉下来的」</strong>
+      共有关卡难度效应合计使复活 +0.009（变差）。下表是少数真正降复活的关——它们拉低了部分复活，但抵不过更多关卡复活率上升；整体仍下降是因为 1.0.23 流量更偏前期低复活关。
+    </div>
+    <table>
+      <thead>
+        <tr><th>gn_c_level</th><th>level_no</th><th>人均复活 20→23</th><th>Δ</th><th>难度贡献</th><th>改版</th></tr>
+      </thead>
+      <tbody id="revive-table"></tbody>
+    </table>
+
+    <h2>跨指标「共同推手」</h2>
+    <p class="muted">同时对胜率↑、濒死↓、复活↓（难度侧）贡献靠前的关卡：</p>
+    <div class="combo"><span class="pill">gn 40</span>胜率↑ + 濒死↓ 双高贡献，前期核心关</div>
+    <div class="combo"><span class="pill">gn 59</span>胜率↑7.4pp，濒死人均 −0.17</div>
+    <div class="combo"><span class="pill">gn 48</span>胜率↑7.2pp，濒死同步下降</div>
+    <div class="combo"><span class="pill">gn 90</span>濒死与复活双降，中期关</div>
+    <div class="combo"><span class="pill">gn 1227</span>超难关：濒死 −2.9、复活 −2.0（量小但斜率大）</div>
+    <div class="combo"><span class="pill">gn 1187</span>超难关：濒死/复活显著下降</div>
+    <div class="combo"><span class="pill">gn 1169</span>濒死 −1.63、复活 −0.79</div>
+    <div class="combo"><span class="pill">gn 1170</span>复活人均 −0.82，濒死同步改善</div>
+
+    <h2>方法说明</h2>
+    <p class="muted">· 对比基线：同窗口 1.0.20 vs 1.0.23；共有 gn_c_level 4404 个；开局样本量 219 万 vs 112 万。</p>
+    <p class="muted">· 胜率按 end 用户加权；濒死/复活按 start 用户加权（人均 × 开局人数还原总量）。</p>
+    <p class="muted">· Kitagawa 分解：Δ ≈ 结构效应（份额变化 × 平均 rate）+ 难度效应（平均份额 × rate 变化）。</p>
+    <p class="muted">· 「改版」标记：该 gn 在两版本出现的 level_ver 集合不同（可能含关卡内容调整）。</p>
+
+    <footer>导出自 Cursor Canvas「1.0.23 关卡贡献拆解」· 数据源：关卡(unique)_全量数据_20260724_20260725.csv</footer>
+  </div>
+
+  <script>
+    const TOP_WIN = [
+      { gn: 40, ln: 40, w: "62.2% → 69.4%", d: "+7.1pp", c: "+2.55bp", ver: true, bar: 2.55 },
+      { gn: 48, ln: 48, w: "68.4% → 75.6%", d: "+7.2pp", c: "+2.22bp", ver: false, bar: 2.22 },
+      { gn: 1, ln: 1, w: "96.2% → 97.9%", d: "+1.7pp", c: "+2.01bp", ver: true, bar: 2.01 },
+      { gn: 59, ln: 59, w: "58.9% → 66.4%", d: "+7.4pp", c: "+2.01bp", ver: false, bar: 2.01 },
+      { gn: 19, ln: 19, w: "75.4% → 78.7%", d: "+3.2pp", c: "+1.83bp", ver: false, bar: 1.83 },
+      { gn: 10, ln: 10, w: "82.3% → 84.5%", d: "+2.2pp", c: "+1.75bp", ver: true, bar: 1.75 },
+      { gn: 20, ln: 12, w: "75.6% → 78.6%", d: "+3.0pp", c: "+1.62bp", ver: false, bar: 1.62 },
+      { gn: 22, ln: 22, w: "82.4% → 85.6%", d: "+3.2pp", c: "+1.60bp", ver: false, bar: 1.60 },
+      { gn: 15, ln: 15, w: "84.9% → 87.3%", d: "+2.4pp", c: "+1.59bp", ver: false, bar: 1.59 },
+      { gn: 55, ln: 55, w: "76.6% → 81.6%", d: "+5.0pp", c: "+1.42bp", ver: true, bar: 1.42 },
+      { gn: 47, ln: 47, w: "77.3% → 81.5%", d: "+4.2pp", c: "+1.32bp", ver: false, bar: 1.32 },
+      { gn: 52, ln: 52, w: "72.7% → 76.9%", d: "+4.3pp", c: "+1.24bp", ver: false, bar: 1.24 },
+    ];
+
+    const TOP_NEAR = [
+      { gn: 40, ln: 40, w: "0.504 → 0.322", d: "-0.183", c: "-0.70‰", ver: true, bar: 0.70 },
+      { gn: 59, ln: 59, w: "0.622 → 0.456", d: "-0.166", c: "-0.47‰", ver: false, bar: 0.47 },
+      { gn: 1227, ln: 1227, w: "14.51 → 11.58", d: "-2.94", c: "-0.35‰", ver: true, bar: 0.35 },
+      { gn: 90, ln: 90, w: "0.942 → 0.799", d: "-0.143", c: "-0.32‰", ver: false, bar: 0.32 },
+      { gn: 1187, ln: 1187, w: "13.33 → 11.33", d: "-2.00", c: "-0.30‰", ver: true, bar: 0.30 },
+      { gn: 48, ln: 48, w: "0.350 → 0.259", d: "-0.091", c: "-0.29‰", ver: false, bar: 0.29 },
+      { gn: 140, ln: 140, w: "1.081 → 0.924", d: "-0.157", c: "-0.25‰", ver: false, bar: 0.25 },
+      { gn: 360, ln: 360, w: "1.210 → 0.926", d: "-0.284", c: "-0.25‰", ver: true, bar: 0.25 },
+      { gn: 1156, ln: 1156, w: "5.850 → 3.886", d: "-1.96", c: "-0.22‰", ver: true, bar: 0.22 },
+      { gn: 80, ln: 80, w: "0.486 → 0.389", d: "-0.097", c: "-0.21‰", ver: false, bar: 0.21 },
+      { gn: 1169, ln: 1169, w: "3.439 → 1.805", d: "-1.63", c: "-0.20‰", ver: true, bar: 0.20 },
+      { gn: 459, ln: 459, w: "2.138 → 1.843", d: "-0.294", c: "-0.20‰", ver: true, bar: 0.20 },
+    ];
+
+    const TOP_REVIVE = [
+      { gn: 1227, ln: 1227, w: "8.99 → 6.96", d: "-2.03", c: "-0.24‰", ver: true },
+      { gn: 90, ln: 90, w: "0.325 → 0.255", d: "-0.070", c: "-0.16‰", ver: false },
+      { gn: 1170, ln: 1170, w: "7.32 → 6.50", d: "-0.82", c: "-0.11‰", ver: true },
+      { gn: 904, ln: 904, w: "2.43 → 1.93", d: "-0.49", c: "-0.11‰", ver: true },
+      { gn: 1169, ln: 1169, w: "1.90 → 1.12", d: "-0.79", c: "-0.10‰", ver: true },
+      { gn: 1187, ln: 1187, w: "7.10 → 6.48", d: "-0.63", c: "-0.09‰", ver: true },
+      { gn: 625, ln: 625, w: "0.887 → 0.688", d: "-0.199", c: "-0.09‰", ver: true },
+      { gn: 603, ln: 603, w: "0.586 → 0.434", d: "-0.152", c: "-0.08‰", ver: false },
+      { gn: 628, ln: 628, w: "0.844 → 0.678", d: "-0.165", c: "-0.07‰", ver: true },
+      { gn: 622, ln: 622, w: "1.214 → 1.060", d: "-0.154", c: "-0.07‰", ver: true },
+      { gn: 1165, ln: 1165, w: "1.451 → 0.792", d: "-0.659", c: "-0.07‰", ver: true },
+      { gn: 763, ln: 763, w: "1.567 → 1.336", d: "-0.231", c: "-0.07‰", ver: true },
+    ];
+
+    const TRAFFIC = {
+      labels: ["1-50", "51-100", "101-200", "201-500", "501-1000", "1000+"],
+      v20: [23.4, 11.9, 15.7, 25.3, 18.1, 5.7],
+      v23: [33.1, 11.5, 13.5, 22.0, 14.8, 5.1],
+    };
+
+    function fillTable(id, rows) {
+      document.getElementById(id).innerHTML = rows.map(r => `
+        <tr class="${r.ver ? "changed" : ""}">
+          <td>${r.gn}</td><td>${r.ln}</td><td>${r.w}</td><td>${r.d}</td><td>${r.c}</td>
+          <td>${r.ver ? "level_ver 变" : "—"}</td>
+        </tr>`).join("");
+    }
+
+    function fillBars(id, rows, max, cls) {
+      document.getElementById(id).innerHTML = rows.slice(0, 10).map(r => `
+        <div class="bar-row">
+          <span>${r.gn}</span>
+          <div class="bar-track"><div class="bar-fill ${cls || ""}" style="width:${(r.bar / max) * 100}%"></div></div>
+          <span>${r.bar}</span>
+        </div>`).join("");
+    }
+
+    function fillTraffic() {
+      const max = Math.max(...TRAFFIC.v20, ...TRAFFIC.v23);
+      document.getElementById("traffic-bars").innerHTML = TRAFFIC.labels.map((lab, i) => `
+        <div class="group-item">
+          <span>${lab}</span>
+          <div class="twin">
+            <div class="bar-track"><div class="bar-fill" style="width:${(TRAFFIC.v20[i] / max) * 100}%;background:#8b93a7"></div></div>
+            <div class="bar-track"><div class="bar-fill accent" style="width:${(TRAFFIC.v23[i] / max) * 100}%"></div></div>
+          </div>
+        </div>`).join("");
+    }
+
+    fillTable("win-table", TOP_WIN);
+    fillTable("near-table", TOP_NEAR);
+    fillTable("revive-table", TOP_REVIVE);
+    fillBars("win-bars", TOP_WIN, 2.55, "");
+    fillBars("near-bars", TOP_NEAR, 0.70, "info");
+    fillTraffic();
+  </script>
+</body>
+</html>
