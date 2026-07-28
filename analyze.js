@@ -269,7 +269,7 @@ function applyPlan(shelves, plan) {
   return true;
 }
 
-function rankGreedyActions(shelves, actions, random, topK = 5) {
+function rankGreedyActions(shelves, actions, random, topK = 5, planMaxLen = 4) {
   const specials = actions.filter((a) => a.type === "special");
   if (specials.length) {
     const chosen = pickRandom(specials, random);
@@ -286,10 +286,14 @@ function rankGreedyActions(shelves, actions, random, topK = 5) {
     action,
     ...scoreActionDetailed(shelves, action),
   }));
-  const scoredPlans = findFrontMatchPlans(shelves, 4).map((plan) => ({
-    action: plan,
-    ...scorePlan(plan),
-  }));
+  // planMaxLen < 2 skips expensive multi-step DFS (biggest speed lever)
+  const scoredPlans =
+    planMaxLen >= 2
+      ? findFrontMatchPlans(shelves, planMaxLen).map((plan) => ({
+          action: plan,
+          ...scorePlan(plan),
+        }))
+      : [];
   const scored = scoredPlans.concat(scoredAtom);
   scored.sort((a, b) => b.score - a.score);
 
@@ -306,6 +310,7 @@ export function playout(rawLevel, options = {}) {
   const seed = options.seed ?? 1;
   const wantTrace = Boolean(options.trace);
   const topK = options.topK ?? 5;
+  const planMaxLen = options.planMaxLen ?? 4;
 
   const state = createState(rawLevel);
   const shelves = state.shelves;
@@ -434,7 +439,7 @@ export function playout(rawLevel, options = {}) {
       continue;
     }
 
-    const ranking = rankGreedyActions(shelves, actions, random, topK);
+    const ranking = rankGreedyActions(shelves, actions, random, topK, planMaxLen);
     chosen = ranking.chosen;
     ranked = ranking.ranked;
 
@@ -498,7 +503,7 @@ export function playout(rawLevel, options = {}) {
   }
 }
 
-export { describeAction, scoreActionDetailed, findFrontMatchPlans };
+export { describeAction, scoreActionDetailed, findFrontMatchPlans, buildReport };
 
 function percentile(sorted, p) {
   if (!sorted.length) return 0;
@@ -591,7 +596,7 @@ function yieldToUi() {
 
 /**
  * @param {any} rawLevel
- * @param {{trials?:number, strategy?:string, maxMoves?:number, seed?:number, onProgress?:Function, chunkSize?:number}} options
+ * @param {{trials?:number, strategy?:string, maxMoves?:number, seed?:number, onProgress?:Function, chunkSize?:number, planMaxLen?:number}} options
  */
 export async function analyzeLevelAsync(rawLevel, options = {}) {
   const trials = options.trials ?? 200;
@@ -599,11 +604,12 @@ export async function analyzeLevelAsync(rawLevel, options = {}) {
   const maxMoves = options.maxMoves ?? 2500;
   const seed0 = options.seed ?? 42;
   const chunkSize = Math.max(1, options.chunkSize ?? 8);
+  const planMaxLen = options.planMaxLen ?? 4;
   const onProgress = options.onProgress;
 
   const state0 = createState(rawLevel);
   const profile = staticProfile(state0.shelves);
-  const config = { trials, strategy, maxMoves, seed: seed0 };
+  const config = { trials, strategy, maxMoves, seed: seed0, planMaxLen };
 
   const results = [];
   const startedAt = performance.now();
@@ -614,6 +620,7 @@ export async function analyzeLevelAsync(rawLevel, options = {}) {
       strategy,
       maxMoves,
       seed,
+      planMaxLen,
     });
     result.trialIndex = i;
     results.push(result);
@@ -643,14 +650,49 @@ export async function analyzeLevelAsync(rawLevel, options = {}) {
 }
 
 /**
+ * Run a contiguous trial index range (for multi-worker splitting).
+ * Seeds match analyzeLevelAsync: seed0 + trialIndex * 9973.
+ */
+export function runTrialChunk(rawLevel, options = {}) {
+  const {
+    startIndex = 0,
+    count = 1,
+    strategy = "greedy",
+    maxMoves = 2500,
+    seed: seed0 = 42,
+    planMaxLen = 4,
+  } = options;
+
+  const results = [];
+  for (let i = 0; i < count; i += 1) {
+    const trialIndex = startIndex + i;
+    const seed = (seed0 + trialIndex * 9973) >>> 0;
+    const result = playout(rawLevel, {
+      strategy,
+      maxMoves,
+      seed,
+      planMaxLen,
+    });
+    result.trialIndex = trialIndex;
+    results.push(result);
+  }
+  return results;
+}
+
+export function getLevelProfile(rawLevel) {
+  return staticProfile(createState(rawLevel).shelves);
+}
+
+/**
  * @param {any} rawLevel
- * @param {{trials?:number, strategy?:string, maxMoves?:number, seed?:number}} options
+ * @param {{trials?:number, strategy?:string, maxMoves?:number, seed?:number, planMaxLen?:number}} options
  */
 export function analyzeLevel(rawLevel, options = {}) {
   const trials = options.trials ?? 200;
   const strategy = options.strategy ?? "greedy";
   const maxMoves = options.maxMoves ?? 2500;
   const seed0 = options.seed ?? 42;
+  const planMaxLen = options.planMaxLen ?? 4;
 
   const state0 = createState(rawLevel);
   const profile = staticProfile(state0.shelves);
@@ -662,6 +704,7 @@ export function analyzeLevel(rawLevel, options = {}) {
       strategy,
       maxMoves,
       seed,
+      planMaxLen,
     });
     result.trialIndex = i;
     results.push(result);
@@ -672,6 +715,7 @@ export function analyzeLevel(rawLevel, options = {}) {
     strategy,
     maxMoves,
     seed: seed0,
+    planMaxLen,
   });
 }
 
