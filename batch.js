@@ -1,86 +1,212 @@
 /**
  * Batch-simulate levels from a dragged Excel file.
  * Reads 物品数据 / itemData, runs greedy Monte Carlo, writes metrics back.
- * Heavy simulation runs in a Web Worker so the page stays responsive.
+ * Uses a Web Worker pool + optional fast mode (skip multi-step plan DFS).
  */
 
-import { analyzeLevelAsync } from "./analyze.js";
+import {
+  analyzeLevelAsync,
+  buildReport,
+  getLevelProfile,
+} from "./analyze.js";
 
-let analyzeWorker = null;
 let analyzeReqId = 0;
-/** @type {{ id: number, reject: (err: Error) => void, onMessage: (e: MessageEvent) => void } | null} */
-let pendingAnalyze = null;
+/** @type {Worker[]} */
+let workerPool = [];
+/** @type {Map<number, { resolve: Function, reject: Function, onProgress?: Function, kind: string }>} */
+const pendingById = new Map();
+
+function poolSize() {
+  const cores = typeof navigator !== "undefined" ? navigator.hardwareConcurrency || 4 : 4;
+  return Math.max(2, Math.min(6, cores - 1));
+}
 
 function terminateAnalyzeWorker() {
-  const pending = pendingAnalyze;
-  pendingAnalyze = null;
-  if (pending && analyzeWorker) {
-    analyzeWorker.removeEventListener("message", pending.onMessage);
+  for (const [, pending] of pendingById) {
     try {
       pending.reject(new Error("cancelled"));
     } catch {
       /* already settled */
     }
   }
-  if (analyzeWorker) {
-    analyzeWorker.terminate();
-    analyzeWorker = null;
+  pendingById.clear();
+  for (const w of workerPool) {
+    try {
+      w.terminate();
+    } catch {
+      /* ignore */
+    }
   }
+  workerPool = [];
 }
 
-function getAnalyzeWorker() {
-  if (analyzeWorker) return analyzeWorker;
-  analyzeWorker = new Worker(new URL("./analyze-worker.js", import.meta.url), {
-    type: "module",
+function onWorkerMessage(event) {
+  const msg = event.data || {};
+  const pending = pendingById.get(msg.id);
+  if (!pending) return;
+
+  if (msg.type === "progress") {
+    pending.onProgress?.(msg);
+    return;
+  }
+
+  pendingById.delete(msg.id);
+  if (msg.type === "error") {
+    pending.reject(new Error(msg.message || "Worker 分析失败"));
+    return;
+  }
+  if (msg.type === "chunk-result") {
+    pending.resolve(msg.results || []);
+    return;
+  }
+  if (msg.type === "result") {
+    pending.resolve(msg.report);
+    return;
+  }
+  pending.reject(new Error("未知 Worker 响应"));
+}
+
+function ensureWorkerPool() {
+  if (workerPool.length) return workerPool;
+  const n = poolSize();
+  for (let i = 0; i < n; i += 1) {
+    const w = new Worker(new URL("./analyze-worker.js", import.meta.url), {
+      type: "module",
+    });
+    w.onmessage = onWorkerMessage;
+    w.onerror = () => {
+      // Fall through: callers may recreate pool next time
+    };
+    workerPool.push(w);
+  }
+  return workerPool;
+}
+
+function postToWorker(worker, payload, { onProgress } = {}) {
+  const id = (analyzeReqId += 1);
+  return new Promise((resolve, reject) => {
+    pendingById.set(id, { resolve, reject, onProgress, kind: payload.type });
+    worker.postMessage({ ...payload, id });
   });
-  analyzeWorker.onerror = () => {
-    terminateAnalyzeWorker();
-  };
-  return analyzeWorker;
+}
+
+function splitRanges(total, parts) {
+  const n = Math.min(parts, Math.max(1, total));
+  const ranges = [];
+  let start = 0;
+  for (let i = 0; i < n; i += 1) {
+    const left = n - i;
+    const count = Math.ceil((total - start) / left);
+    if (count <= 0) break;
+    ranges.push({ startIndex: start, count });
+    start += count;
+  }
+  return ranges;
 }
 
 /**
- * Run one level off the main thread. Falls back to async main-thread analyze.
+ * Parallel trial chunks across the worker pool; merge into one report.
  */
-function analyzeLevelOffMain(rawLevel, options = {}) {
+async function analyzeLevelParallel(rawLevel, options = {}) {
+  const trials = options.trials ?? 20;
+  const strategy = options.strategy ?? "greedy";
+  const maxMoves = options.maxMoves ?? 2500;
+  const seed = options.seed ?? 42;
+  const planMaxLen = options.planMaxLen ?? 0;
+  const onProgress = options.onProgress;
+
+  let workers;
   try {
-    const worker = getAnalyzeWorker();
-    const id = (analyzeReqId += 1);
-    return new Promise((resolve, reject) => {
-      const onMessage = (event) => {
-        const msg = event.data || {};
-        if (msg.id !== id) return;
-        if (msg.type === "progress") {
-          options.onProgress?.(msg);
-          return;
-        }
-        if (pendingAnalyze?.id === id) pendingAnalyze = null;
-        worker.removeEventListener("message", onMessage);
-        if (msg.type === "result") resolve(msg.report);
-        else reject(new Error(msg.message || "Worker 分析失败"));
-      };
-      pendingAnalyze = { id, reject, onMessage };
-      worker.addEventListener("message", onMessage);
-      worker.postMessage({
-        type: "analyze",
-        id,
-        rawLevel,
-        options: {
-          trials: options.trials,
-          strategy: options.strategy,
-          maxMoves: options.maxMoves,
-          seed: options.seed,
-          chunkSize: options.chunkSize ?? 2,
-        },
-      });
-    });
+    workers = ensureWorkerPool();
   } catch {
+    workers = null;
+  }
+
+  // Main-thread fallback (or tiny jobs): keep behavior correct
+  if (!workers?.length || trials <= 2) {
+    if (workers) {
+      // still prefer one worker for UI responsiveness
+      try {
+        const w = workers[0];
+        return await postToWorker(
+          w,
+          {
+            type: "analyze",
+            rawLevel,
+            options: {
+              trials,
+              strategy,
+              maxMoves,
+              seed,
+              planMaxLen,
+              chunkSize: trials,
+            },
+          },
+          { onProgress },
+        );
+      } catch (err) {
+        if (err?.message === "cancelled") throw err;
+      }
+    }
     return analyzeLevelAsync(rawLevel, {
-      ...options,
-      chunkSize: options.chunkSize ?? 1,
+      trials,
+      strategy,
+      maxMoves,
+      seed,
+      planMaxLen,
+      chunkSize: 1,
+      onProgress,
     });
   }
+
+  const ranges = splitRanges(trials, workers.length);
+  let doneTrials = 0;
+  const startedAt = performance.now();
+
+  const chunkPromises = ranges.map((range, i) =>
+    postToWorker(workers[i % workers.length], {
+      type: "chunk",
+      rawLevel,
+      options: {
+        startIndex: range.startIndex,
+        count: range.count,
+        strategy,
+        maxMoves,
+        seed,
+        planMaxLen,
+      },
+    }).then((results) => {
+      doneTrials += results.length;
+      if (onProgress) {
+        const elapsedMs = performance.now() - startedAt;
+        onProgress({
+          done: doneTrials,
+          total: trials,
+          elapsedMs,
+          etaMs: doneTrials ? ((trials - doneTrials) * elapsedMs) / doneTrials : 0,
+          msPerTrial: doneTrials ? elapsedMs / doneTrials : 0,
+        });
+      }
+      return results;
+    }),
+  );
+
+  const parts = await Promise.all(chunkPromises);
+  const results = parts.flat().sort((a, b) => a.trialIndex - b.trialIndex);
+  const profile = getLevelProfile(rawLevel);
+  const report = buildReport(results, profile, {
+    trials,
+    strategy,
+    maxMoves,
+    seed,
+    planMaxLen,
+  });
+  const { results: _drop, ...slim } = report;
+  return slim;
 }
+
+/** @deprecated name kept for call sites clarity */
+const analyzeLevelOffMain = analyzeLevelParallel;
 
 const RESULT_FIELDS = [
   { key: "simDifficulty", zh: "模拟难度分", en: "simDifficulty", from: (s) => s.difficulty },
@@ -288,6 +414,7 @@ const els = {
   btnStop: document.getElementById("btnBatchStop"),
   btnDownload: document.getElementById("btnBatchDownload"),
   trials: document.getElementById("batchTrials"),
+  fastMode: document.getElementById("batchFastMode"),
 };
 
 const state = {
@@ -310,6 +437,10 @@ function readTrials() {
   const n = Number(els.trials?.value);
   if (!Number.isFinite(n)) return 20;
   return Math.min(500, Math.max(5, Math.round(n)));
+}
+
+function readFastMode() {
+  return els.fastMode ? Boolean(els.fastMode.checked) : true;
 }
 
 function metricsFromReport(report) {
@@ -509,6 +640,7 @@ async function parseFile(file) {
 async function runBatch() {
   if (state.running || !state.rows.length) return;
   const trials = readTrials();
+  const fast = readFastMode();
   if (els.trials) els.trials.value = String(trials);
 
   state.running = true;
@@ -521,6 +653,19 @@ async function runBatch() {
   const total = state.rows.length;
   const startedAt = performance.now();
   let done = 0;
+  const planMaxLen = fast ? 0 : 4;
+  const maxMoves = fast ? 2500 : 5000;
+  const workers = (() => {
+    try {
+      return ensureWorkerPool().length;
+    } catch {
+      return 1;
+    }
+  })();
+
+  setStatus(
+    `开始批量：${total} 关 × ${trials} 局 · ${fast ? "快速模式" : "精确模式"} · ${workers} 线程`,
+  );
 
   for (let i = 0; i < total; i += 1) {
     if (state.stop) break;
@@ -536,20 +681,22 @@ async function runBatch() {
 
     row.status = "running";
     updateRowDom(i);
-    setStatus(`正在模拟关卡 ${row.levelId}（${i + 1}/${total}）· 每关 ${trials} 局…`);
+    setStatus(
+      `正在模拟关卡 ${row.levelId}（${i + 1}/${total}）· 每关 ${trials} 局 · ${fast ? "快速" : "精确"}…`,
+    );
 
     try {
       const report = await analyzeLevelOffMain(row.level, {
         trials,
         strategy: "greedy",
-        maxMoves: 5000,
+        maxMoves,
         seed: 42,
-        chunkSize: 2,
+        planMaxLen,
         onProgress: (p) => {
           if (state.stop) return;
           const levelPct = p.total ? Math.round((p.done / p.total) * 100) : 0;
           setStatus(
-            `关卡 ${row.levelId}（${i + 1}/${total}）· 局 ${p.done}/${p.total}（${levelPct}%）· 后台计算中…`,
+            `关卡 ${row.levelId}（${i + 1}/${total}）· 局 ${p.done}/${p.total}（${levelPct}%）· ${workers} 核并行…`,
           );
         },
       });
@@ -591,7 +738,7 @@ async function runBatch() {
   els.btnDownload.disabled = false;
 
   if (state.stop) setStatus(`已停止：完成 ${done}/${total}。可下载当前结果。`);
-  else setStatus(`全部完成：${total} 关 × ${trials} 局。点击「下载结果表」。`);
+  else setStatus(`全部完成：${total} 关 × ${trials} 局（${fast ? "快速" : "精确"}）。点击「下载结果表」。`);
 }
 
 function downloadResult() {
