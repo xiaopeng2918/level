@@ -1,212 +1,86 @@
 /**
  * Batch-simulate levels from a dragged Excel file.
  * Reads 物品数据 / itemData, runs greedy Monte Carlo, writes metrics back.
- * Uses a Web Worker pool + optional fast mode (skip multi-step plan DFS).
+ * Heavy simulation runs in a Web Worker so the page stays responsive.
  */
 
-import {
-  analyzeLevelAsync,
-  buildReport,
-  getLevelProfile,
-} from "./analyze.js";
+import { analyzeLevelAsync } from "./analyze.js?v=20260730d";
 
+let analyzeWorker = null;
 let analyzeReqId = 0;
-/** @type {Worker[]} */
-let workerPool = [];
-/** @type {Map<number, { resolve: Function, reject: Function, onProgress?: Function, kind: string }>} */
-const pendingById = new Map();
-
-function poolSize() {
-  const cores = typeof navigator !== "undefined" ? navigator.hardwareConcurrency || 4 : 4;
-  return Math.max(2, Math.min(6, cores - 1));
-}
+/** @type {{ id: number, reject: (err: Error) => void, onMessage: (e: MessageEvent) => void } | null} */
+let pendingAnalyze = null;
 
 function terminateAnalyzeWorker() {
-  for (const [, pending] of pendingById) {
+  const pending = pendingAnalyze;
+  pendingAnalyze = null;
+  if (pending && analyzeWorker) {
+    analyzeWorker.removeEventListener("message", pending.onMessage);
     try {
       pending.reject(new Error("cancelled"));
     } catch {
       /* already settled */
     }
   }
-  pendingById.clear();
-  for (const w of workerPool) {
-    try {
-      w.terminate();
-    } catch {
-      /* ignore */
-    }
+  if (analyzeWorker) {
+    analyzeWorker.terminate();
+    analyzeWorker = null;
   }
-  workerPool = [];
 }
 
-function onWorkerMessage(event) {
-  const msg = event.data || {};
-  const pending = pendingById.get(msg.id);
-  if (!pending) return;
-
-  if (msg.type === "progress") {
-    pending.onProgress?.(msg);
-    return;
-  }
-
-  pendingById.delete(msg.id);
-  if (msg.type === "error") {
-    pending.reject(new Error(msg.message || "Worker 分析失败"));
-    return;
-  }
-  if (msg.type === "chunk-result") {
-    pending.resolve(msg.results || []);
-    return;
-  }
-  if (msg.type === "result") {
-    pending.resolve(msg.report);
-    return;
-  }
-  pending.reject(new Error("未知 Worker 响应"));
-}
-
-function ensureWorkerPool() {
-  if (workerPool.length) return workerPool;
-  const n = poolSize();
-  for (let i = 0; i < n; i += 1) {
-    const w = new Worker(new URL("./analyze-worker.js", import.meta.url), {
-      type: "module",
-    });
-    w.onmessage = onWorkerMessage;
-    w.onerror = () => {
-      // Fall through: callers may recreate pool next time
-    };
-    workerPool.push(w);
-  }
-  return workerPool;
-}
-
-function postToWorker(worker, payload, { onProgress } = {}) {
-  const id = (analyzeReqId += 1);
-  return new Promise((resolve, reject) => {
-    pendingById.set(id, { resolve, reject, onProgress, kind: payload.type });
-    worker.postMessage({ ...payload, id });
+function getAnalyzeWorker() {
+  if (analyzeWorker) return analyzeWorker;
+  analyzeWorker = new Worker(new URL("./analyze-worker.js", import.meta.url), {
+    type: "module",
   });
-}
-
-function splitRanges(total, parts) {
-  const n = Math.min(parts, Math.max(1, total));
-  const ranges = [];
-  let start = 0;
-  for (let i = 0; i < n; i += 1) {
-    const left = n - i;
-    const count = Math.ceil((total - start) / left);
-    if (count <= 0) break;
-    ranges.push({ startIndex: start, count });
-    start += count;
-  }
-  return ranges;
+  analyzeWorker.onerror = () => {
+    terminateAnalyzeWorker();
+  };
+  return analyzeWorker;
 }
 
 /**
- * Parallel trial chunks across the worker pool; merge into one report.
+ * Run one level off the main thread. Falls back to async main-thread analyze.
  */
-async function analyzeLevelParallel(rawLevel, options = {}) {
-  const trials = options.trials ?? 20;
-  const strategy = options.strategy ?? "greedy";
-  const maxMoves = options.maxMoves ?? 2500;
-  const seed = options.seed ?? 42;
-  const planMaxLen = options.planMaxLen ?? 0;
-  const onProgress = options.onProgress;
-
-  let workers;
+function analyzeLevelOffMain(rawLevel, options = {}) {
   try {
-    workers = ensureWorkerPool();
+    const worker = getAnalyzeWorker();
+    const id = (analyzeReqId += 1);
+    return new Promise((resolve, reject) => {
+      const onMessage = (event) => {
+        const msg = event.data || {};
+        if (msg.id !== id) return;
+        if (msg.type === "progress") {
+          options.onProgress?.(msg);
+          return;
+        }
+        if (pendingAnalyze?.id === id) pendingAnalyze = null;
+        worker.removeEventListener("message", onMessage);
+        if (msg.type === "result") resolve(msg.report);
+        else reject(new Error(msg.message || "Worker 分析失败"));
+      };
+      pendingAnalyze = { id, reject, onMessage };
+      worker.addEventListener("message", onMessage);
+      worker.postMessage({
+        type: "analyze",
+        id,
+        rawLevel,
+        options: {
+          trials: options.trials,
+          strategy: options.strategy,
+          maxMoves: options.maxMoves,
+          seed: options.seed,
+          chunkSize: options.chunkSize ?? 2,
+        },
+      });
+    });
   } catch {
-    workers = null;
-  }
-
-  // Main-thread fallback (or tiny jobs): keep behavior correct
-  if (!workers?.length || trials <= 2) {
-    if (workers) {
-      // still prefer one worker for UI responsiveness
-      try {
-        const w = workers[0];
-        return await postToWorker(
-          w,
-          {
-            type: "analyze",
-            rawLevel,
-            options: {
-              trials,
-              strategy,
-              maxMoves,
-              seed,
-              planMaxLen,
-              chunkSize: trials,
-            },
-          },
-          { onProgress },
-        );
-      } catch (err) {
-        if (err?.message === "cancelled") throw err;
-      }
-    }
     return analyzeLevelAsync(rawLevel, {
-      trials,
-      strategy,
-      maxMoves,
-      seed,
-      planMaxLen,
-      chunkSize: 1,
-      onProgress,
+      ...options,
+      chunkSize: options.chunkSize ?? 1,
     });
   }
-
-  const ranges = splitRanges(trials, workers.length);
-  let doneTrials = 0;
-  const startedAt = performance.now();
-
-  const chunkPromises = ranges.map((range, i) =>
-    postToWorker(workers[i % workers.length], {
-      type: "chunk",
-      rawLevel,
-      options: {
-        startIndex: range.startIndex,
-        count: range.count,
-        strategy,
-        maxMoves,
-        seed,
-        planMaxLen,
-      },
-    }).then((results) => {
-      doneTrials += results.length;
-      if (onProgress) {
-        const elapsedMs = performance.now() - startedAt;
-        onProgress({
-          done: doneTrials,
-          total: trials,
-          elapsedMs,
-          etaMs: doneTrials ? ((trials - doneTrials) * elapsedMs) / doneTrials : 0,
-          msPerTrial: doneTrials ? elapsedMs / doneTrials : 0,
-        });
-      }
-      return results;
-    }),
-  );
-
-  const parts = await Promise.all(chunkPromises);
-  const results = parts.flat().sort((a, b) => a.trialIndex - b.trialIndex);
-  const profile = getLevelProfile(rawLevel);
-  const report = buildReport(results, profile, {
-    trials,
-    strategy,
-    maxMoves,
-    seed,
-    planMaxLen,
-  });
-  const { results: _drop, ...slim } = report;
-  return slim;
 }
-
-/** @deprecated name kept for call sites clarity */
-const analyzeLevelOffMain = analyzeLevelParallel;
 
 const RESULT_FIELDS = [
   { key: "simDifficulty", zh: "模拟难度分", en: "simDifficulty", from: (s) => s.difficulty },
@@ -389,17 +263,34 @@ function parseLevelJson(raw) {
 
 function loadXlsxLib() {
   if (window.XLSX) return Promise.resolve(window.XLSX);
-  return new Promise((resolve, reject) => {
-    const script = document.createElement("script");
-    script.src = "https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js";
-    script.async = true;
-    script.onload = () => {
-      if (window.XLSX) resolve(window.XLSX);
-      else reject(new Error("SheetJS 加载失败"));
-    };
-    script.onerror = () => reject(new Error("无法加载 SheetJS，请检查网络"));
-    document.head.appendChild(script);
-  });
+
+  const sources = [
+    "./vendor/xlsx.full.min.js",
+    "./node_modules/xlsx/dist/xlsx.full.min.js",
+    "https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js",
+  ];
+
+  const tryLoad = (i) =>
+    new Promise((resolve, reject) => {
+      if (i >= sources.length) {
+        reject(new Error("无法加载 SheetJS（本地与 CDN 均失败）"));
+        return;
+      }
+      const script = document.createElement("script");
+      script.src = sources[i];
+      script.async = true;
+      script.onload = () => {
+        if (window.XLSX) resolve(window.XLSX);
+        else tryLoad(i + 1).then(resolve, reject);
+      };
+      script.onerror = () => {
+        script.remove();
+        tryLoad(i + 1).then(resolve, reject);
+      };
+      document.head.appendChild(script);
+    });
+
+  return tryLoad(0);
 }
 
 const els = {
@@ -414,7 +305,6 @@ const els = {
   btnStop: document.getElementById("btnBatchStop"),
   btnDownload: document.getElementById("btnBatchDownload"),
   trials: document.getElementById("batchTrials"),
-  fastMode: document.getElementById("batchFastMode"),
 };
 
 const state = {
@@ -430,17 +320,14 @@ const state = {
 };
 
 function setStatus(text) {
-  if (els.status) els.status.textContent = text;
+  const el = document.getElementById("batchStatus") || els.status;
+  if (el) el.textContent = text;
 }
 
 function readTrials() {
   const n = Number(els.trials?.value);
   if (!Number.isFinite(n)) return 20;
   return Math.min(500, Math.max(5, Math.round(n)));
-}
-
-function readFastMode() {
-  return els.fastMode ? Boolean(els.fastMode.checked) : true;
 }
 
 function metricsFromReport(report) {
@@ -640,7 +527,6 @@ async function parseFile(file) {
 async function runBatch() {
   if (state.running || !state.rows.length) return;
   const trials = readTrials();
-  const fast = readFastMode();
   if (els.trials) els.trials.value = String(trials);
 
   state.running = true;
@@ -653,19 +539,6 @@ async function runBatch() {
   const total = state.rows.length;
   const startedAt = performance.now();
   let done = 0;
-  const planMaxLen = fast ? 0 : 4;
-  const maxMoves = fast ? 2500 : 5000;
-  const workers = (() => {
-    try {
-      return ensureWorkerPool().length;
-    } catch {
-      return 1;
-    }
-  })();
-
-  setStatus(
-    `开始批量：${total} 关 × ${trials} 局 · ${fast ? "快速模式" : "精确模式"} · ${workers} 线程`,
-  );
 
   for (let i = 0; i < total; i += 1) {
     if (state.stop) break;
@@ -681,22 +554,20 @@ async function runBatch() {
 
     row.status = "running";
     updateRowDom(i);
-    setStatus(
-      `正在模拟关卡 ${row.levelId}（${i + 1}/${total}）· 每关 ${trials} 局 · ${fast ? "快速" : "精确"}…`,
-    );
+    setStatus(`正在模拟关卡 ${row.levelId}（${i + 1}/${total}）· 每关 ${trials} 局…`);
 
     try {
       const report = await analyzeLevelOffMain(row.level, {
         trials,
         strategy: "greedy",
-        maxMoves,
+        maxMoves: 5000,
         seed: 42,
-        planMaxLen,
+        chunkSize: 2,
         onProgress: (p) => {
           if (state.stop) return;
           const levelPct = p.total ? Math.round((p.done / p.total) * 100) : 0;
           setStatus(
-            `关卡 ${row.levelId}（${i + 1}/${total}）· 局 ${p.done}/${p.total}（${levelPct}%）· ${workers} 核并行…`,
+            `关卡 ${row.levelId}（${i + 1}/${total}）· 局 ${p.done}/${p.total}（${levelPct}%）· 后台计算中…`,
           );
         },
       });
@@ -738,7 +609,7 @@ async function runBatch() {
   els.btnDownload.disabled = false;
 
   if (state.stop) setStatus(`已停止：完成 ${done}/${total}。可下载当前结果。`);
-  else setStatus(`全部完成：${total} 关 × ${trials} 局（${fast ? "快速" : "精确"}）。点击「下载结果表」。`);
+  else setStatus(`全部完成：${total} 关 × ${trials} 局。点击「下载结果表」。`);
 }
 
 function downloadResult() {
@@ -751,30 +622,101 @@ function downloadResult() {
 }
 
 function bindUi() {
-  if (!els.drop) return;
+  const drop = document.getElementById("batchDrop") || els.drop;
+  const fileInput = document.getElementById("batchFile") || els.file;
+  if (!drop && !fileInput) {
+    console.error("[batch] 找不到上传区域 DOM");
+    return;
+  }
+  if (drop) els.drop = drop;
+  if (fileInput) els.file = fileInput;
+  els.status = document.getElementById("batchStatus") || els.status;
+
+  let lastFileKey = "";
+  let lastFileAt = 0;
 
   const onFile = (file) => {
-    if (!file) return;
-    setStatus(`读取 ${file.name}…`);
+    if (!file) {
+      setStatus("未读到文件内容，请再选一次或换用点击上传");
+      return;
+    }
+    const name = file.name || "未命名.xlsx";
+    const key = `${name}:${file.size}:${file.lastModified}`;
+    const now = Date.now();
+    if (key === lastFileKey && now - lastFileAt < 1500) return;
+    lastFileKey = key;
+    lastFileAt = now;
+
+    setStatus(`读取 ${name}（${Math.max(1, Math.round(file.size / 1024))} KB）…`);
     parseFile(file).catch((err) => {
       setStatus(err.message || String(err));
       console.error(err);
     });
   };
 
-  els.drop.addEventListener("dragover", (e) => {
+  const isFileDrag = (e) => {
+    const types = e.dataTransfer?.types;
+    if (!types) return false;
+    try {
+      return (
+        Array.from(types).includes("Files") ||
+        Array.from(types).includes("application/x-moz-file") ||
+        (typeof types.contains === "function" && types.contains("Files"))
+      );
+    } catch {
+      return true;
+    }
+  };
+
+  window.addEventListener("dragover", (e) => {
+    if (!isFileDrag(e)) return;
     e.preventDefault();
-    els.drop.classList.add("is-dragover");
   });
-  els.drop.addEventListener("dragleave", () => els.drop.classList.remove("is-dragover"));
-  els.drop.addEventListener("drop", (e) => {
+  window.addEventListener("drop", (e) => {
+    if (!isFileDrag(e)) return;
     e.preventDefault();
-    els.drop.classList.remove("is-dragover");
     const file = e.dataTransfer?.files?.[0];
-    onFile(file);
+    if (file) onFile(file);
   });
-  els.drop.addEventListener("click", () => els.file?.click());
-  els.file?.addEventListener("change", () => onFile(els.file.files?.[0]));
+
+  if (drop) {
+    drop.addEventListener("dragenter", (e) => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault();
+      drop.classList.add("is-dragover");
+    });
+    drop.addEventListener("dragover", (e) => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault();
+      drop.classList.add("is-dragover");
+    });
+    drop.addEventListener("dragleave", (e) => {
+      if (e.relatedTarget && drop.contains(e.relatedTarget)) return;
+      drop.classList.remove("is-dragover");
+    });
+    drop.addEventListener("drop", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      drop.classList.remove("is-dragover");
+      onFile(e.dataTransfer?.files?.[0]);
+    });
+  }
+
+  if (fileInput) {
+    fileInput.addEventListener("change", (e) => {
+      const input = e.target || fileInput;
+      const list = input?.files;
+      if (!list || !list.length) return;
+      onFile(list[0]);
+      setTimeout(() => {
+        try {
+          input.value = "";
+        } catch {
+          /* ignore */
+        }
+      }, 0);
+    });
+  }
 
   els.btnStart?.addEventListener("click", () => {
     runBatch().catch((err) => {
@@ -790,6 +732,19 @@ function bindUi() {
     terminateAnalyzeWorker();
   });
   els.btnDownload?.addEventListener("click", downloadResult);
+
+  window.__BATCH_BOUND__ = true;
+  setStatus("等待上传表格…（上传组件已就绪）");
+  loadXlsxLib()
+    .then(() => {
+      const cur = document.getElementById("batchStatus")?.textContent || "";
+      if (cur.includes("上传组件已就绪") || cur.startsWith("等待上传表格")) {
+        setStatus("等待上传表格…（可拖拽或点击上传）");
+      }
+    })
+    .catch((err) => {
+      setStatus(`Excel 解析库加载失败：${err.message || err}`);
+    });
 }
 
 bindUi();

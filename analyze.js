@@ -17,6 +17,7 @@ import {
   isSpecialClearId,
   hashShelves,
   hasContentBehind,
+  isLayerMatched,
 } from "./engine.js";
 
 function rng(seed) {
@@ -152,11 +153,178 @@ function findFrontMatchPlans(shelves, maxLen = 4) {
 }
 
 function scorePlan(plan) {
+  if (plan.planKind === "dig") return scoreDigPlan(plan);
   const score = 840 - plan.atomicCount * 50;
   return {
     score,
     reason: "setup3",
     parts: [`首层多步凑三(id${plan.matchType})×${plan.atomicCount}手+${score}`],
+  };
+}
+
+/** Detect shelves whose front layer was cleared, exposing the next layer. */
+function detectReveals(before, after) {
+  const out = [];
+  for (let i = 0; i < before.length; i += 1) {
+    const b = before[i];
+    const a = after[i];
+    if (!b || !a) continue;
+    if (b.layers.length <= a.layers.length) continue;
+    const layer = frontLayer(a);
+    const revealedIds = layer
+      ? layer.filter((id) => id && !isSpecialClearId(id))
+      : [];
+    out.push({
+      shelf: i,
+      layer: layer ? [...layer] : [],
+      revealedIds,
+    });
+  }
+  return out;
+}
+
+/**
+ * After a dig reveal, which types can actually be eliminated (true 翻层可消):
+ * - revealed layer itself is a triple, or
+ * - revealed ids + prior front counts reach ≥3, or
+ * - after state already has ≥3 of a revealed type on the front.
+ * Empty means reveal-only (多步翻层), not 翻层可消.
+ */
+function digMatchIdsWithPrior(before, after, reveals) {
+  const beforeFront = countFrontTypes(before);
+  const afterFront = countFrontTypes(after);
+  const matchIds = new Set();
+
+  for (const rev of reveals) {
+    if (isLayerMatched(rev.layer) && !isSpecialClearId(rev.layer[0])) {
+      matchIds.add(rev.layer[0]);
+    }
+    const revealedCounts = new Map();
+    for (const id of rev.revealedIds) {
+      revealedCounts.set(id, (revealedCounts.get(id) || 0) + 1);
+    }
+    for (const [id, n] of revealedCounts) {
+      const prior = beforeFront.get(id) || 0;
+      if (n >= 3 || prior + n >= 3 || (afterFront.get(id) || 0) >= 3) {
+        matchIds.add(id);
+      }
+    }
+  }
+
+  return [...matchIds].sort((a, b) => a - b);
+}
+
+function digMatchesPrior(before, after, reveals) {
+  return digMatchIdsWithPrior(before, after, reveals).length > 0;
+}
+
+function digRelevantActions(shelves) {
+  return listActions(shelves).filter((a) => {
+    if (a.type === "special") return hasContentBehind(shelves[a.shelf]);
+    if (a.type === "move") return hasContentBehind(shelves[a.fromShelf]);
+    return false;
+  });
+}
+
+function scoreDigStep(state, action) {
+  let score = 0;
+  if (action.type === "special" && hasContentBehind(state[action.shelf])) {
+    score += 50;
+    return score;
+  }
+  if (action.type !== "move" || !hasContentBehind(state[action.fromShelf])) return score;
+  score += 40;
+  const layer = frontLayer(state[action.fromShelf]);
+  if (layer) {
+    const left = layer.filter((id) => id !== 0 && !isSpecialClearId(id)).length;
+    if (left === 1) score += 80;
+    else if (left === 2) score += 30;
+  }
+  return score;
+}
+
+/**
+ * Multi-step dig plans: keep moving from non-last-layer shelves until a lower
+ * layer is exposed. Prefer reveals that can match with prior front items.
+ */
+function findDigRevealPlans(shelves, maxLen = 4) {
+  if (!shelves.some((s) => hasContentBehind(s))) return [];
+
+  const plans = [];
+  const branchAt = [10, 8, 6, 5];
+
+  function dfs(state, path) {
+    if (plans.length >= 8) return;
+    if (path.length >= maxLen) return;
+    const depth = path.length;
+    const ranked = digRelevantActions(state)
+      .map((a) => ({ a, s: scoreDigStep(state, a) }))
+      .sort((x, y) => y.s - x.s)
+      .slice(0, branchAt[depth] ?? 5);
+
+    for (const { a } of ranked) {
+      if (plans.length >= 8) break;
+      const next = cloneShelves(state);
+      if (!applyAction(next, a)) continue;
+      const newPath = path.concat([a]);
+      const reveals = detectReveals(shelves, next);
+      if (reveals.length) {
+        if (newPath.length >= 2) {
+          const matchIds = digMatchIdsWithPrior(shelves, next, reveals);
+          const canMatchPrior = matchIds.length > 0;
+          plans.push({
+            type: "plan",
+            planKind: "dig",
+            moves: newPath.map((m) => ({ ...m })),
+            atomicCount: newPath.length,
+            reveals,
+            canMatchPrior,
+            matchIds,
+            revealShelf: reveals[0].shelf,
+            revealTypes: [...new Set(reveals.flatMap((r) => r.revealedIds))],
+          });
+        }
+        continue;
+      }
+      if (newPath.length < maxLen) dfs(next, newPath);
+    }
+  }
+
+  dfs(shelves, []);
+  plans.sort(
+    (a, b) =>
+      Number(b.canMatchPrior) - Number(a.canMatchPrior) ||
+      a.atomicCount - b.atomicCount ||
+      a.revealShelf - b.revealShelf,
+  );
+  const uniq = [];
+  const seen = new Set();
+  for (const p of plans) {
+    const k = `${p.canMatchPrior}:${p.atomicCount}:${actionKey(p)}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    uniq.push(p);
+    if (uniq.length >= 8) break;
+  }
+  return uniq;
+}
+
+function scoreDigPlan(plan) {
+  const revealText = (plan.revealTypes || []).join(",") || "?";
+  const matchText = (plan.matchIds || []).join(",") || revealText;
+  if (plan.canMatchPrior && plan.matchIds?.length) {
+    const score = 760 - plan.atomicCount * 45;
+    return {
+      score,
+      reason: "digMatch",
+      parts: [`翻层可消(id${matchText})×${plan.atomicCount}手+${score}`],
+    };
+  }
+  const score = 400 - plan.atomicCount * 40;
+  return {
+    score,
+    reason: "digReveal",
+    parts: [`多步翻层(露出id${revealText})×${plan.atomicCount}手+${score}`],
   };
 }
 
@@ -185,15 +353,30 @@ function scoreActionDetailed(shelves, action) {
   }
 
   const sameOnTarget = willCreate.filter((id) => id === action.id).length;
-  if (sameOnTarget > 0) {
-    score += sameOnTarget * 50;
-    parts.push(`同色×${sameOnTarget}+${sameOnTarget * 50}`);
-  }
 
   const src = shelves[action.fromShelf];
   if (hasContentBehind(src)) {
-    score += 30;
-    parts.push("非末层+30");
+    const snap = cloneShelves(shelves);
+    if (applyAction(snap, action)) {
+      const reveals = detectReveals(shelves, snap);
+      if (reveals.length) {
+        const matchIds = digMatchIdsWithPrior(shelves, snap, reveals);
+        const revealedIds = [...new Set(reveals.flatMap((r) => r.revealedIds))];
+        if (matchIds.length) {
+          score += 220;
+          parts.push(`翻层可消(id${matchIds.join(",")})+220`);
+        } else {
+          score += 90;
+          parts.push(`多步翻层(露出id${revealedIds.join(",") || "?"})+90`);
+        }
+      } else {
+        score += 30;
+        parts.push("非末层+30");
+      }
+    } else {
+      score += 30;
+      parts.push("非末层+30");
+    }
   }
   if (src.width === 1) {
     score += 20;
@@ -212,7 +395,8 @@ function scoreActionDetailed(shelves, action) {
   let reason = "move";
   if (parts.some((p) => p.startsWith("凑三"))) reason = "match3";
   else if (parts.some((p) => p.startsWith("凑对"))) reason = "pair";
-  else if (parts.some((p) => p.startsWith("同色"))) reason = "stack";
+  else if (parts.some((p) => p.startsWith("翻层可消"))) reason = "digMatch";
+  else if (parts.some((p) => p.startsWith("多步翻层"))) reason = "digReveal";
   else if (parts.some((p) => p.startsWith("非末层"))) reason = "dig";
   else if (parts.some((p) => p.startsWith("单格"))) reason = "single";
 
@@ -224,6 +408,13 @@ function describeAction(action) {
   if (action.type === "special") return `点999 @货架${action.shelf}格${action.slot}`;
   if (action.type === "plan") {
     const hands = (action.moves || []).map((m, i) => `${i + 1}.${describeAction(m)}`).join(" → ");
+    if (action.planKind === "dig") {
+      if (action.canMatchPrior && action.matchIds?.length) {
+        return `翻层可消(id${action.matchIds.join(",")})×${action.atomicCount}手：${hands}`;
+      }
+      const revealed = (action.revealTypes || []).join(",") || "?";
+      return `多步翻层(露出id${revealed})×${action.atomicCount}手：${hands}`;
+    }
     return `首层多步凑三(id${action.matchType})×${action.atomicCount}手：${hands}`;
   }
   return `搬 id${action.id}：架${action.fromShelf}格${action.fromSlot} → 架${action.toShelf}格${action.toSlot}`;
@@ -269,7 +460,7 @@ function applyPlan(shelves, plan) {
   return true;
 }
 
-function rankGreedyActions(shelves, actions, random, topK = 5, planMaxLen = 4) {
+function rankGreedyActions(shelves, actions, random, topK = 5) {
   const specials = actions.filter((a) => a.type === "special");
   if (specials.length) {
     const chosen = pickRandom(specials, random);
@@ -286,14 +477,16 @@ function rankGreedyActions(shelves, actions, random, topK = 5, planMaxLen = 4) {
     action,
     ...scoreActionDetailed(shelves, action),
   }));
-  // planMaxLen < 2 skips expensive multi-step DFS (biggest speed lever)
-  const scoredPlans =
-    planMaxLen >= 2
-      ? findFrontMatchPlans(shelves, planMaxLen).map((plan) => ({
-          action: plan,
-          ...scorePlan(plan),
-        }))
-      : [];
+  // Prefer clearing front triples before starting another dig.
+  const frontMatchPlans = findFrontMatchPlans(shelves, 4);
+  const digPlans =
+    frontMatchPlans.length || frontTripleTypes(shelves).size
+      ? []
+      : findDigRevealPlans(shelves, 4);
+  const scoredPlans = frontMatchPlans.concat(digPlans).map((plan) => ({
+    action: plan,
+    ...scorePlan(plan),
+  }));
   const scored = scoredPlans.concat(scoredAtom);
   scored.sort((a, b) => b.score - a.score);
 
@@ -310,7 +503,6 @@ export function playout(rawLevel, options = {}) {
   const seed = options.seed ?? 1;
   const wantTrace = Boolean(options.trace);
   const topK = options.topK ?? 5;
-  const planMaxLen = options.planMaxLen ?? 4;
 
   const state = createState(rawLevel);
   const shelves = state.shelves;
@@ -439,7 +631,7 @@ export function playout(rawLevel, options = {}) {
       continue;
     }
 
-    const ranking = rankGreedyActions(shelves, actions, random, topK, planMaxLen);
+    const ranking = rankGreedyActions(shelves, actions, random, topK);
     chosen = ranking.chosen;
     ranked = ranking.ranked;
 
@@ -503,7 +695,7 @@ export function playout(rawLevel, options = {}) {
   }
 }
 
-export { describeAction, scoreActionDetailed, findFrontMatchPlans, buildReport };
+export { describeAction, scoreActionDetailed, findFrontMatchPlans, findDigRevealPlans };
 
 function percentile(sorted, p) {
   if (!sorted.length) return 0;
@@ -596,7 +788,7 @@ function yieldToUi() {
 
 /**
  * @param {any} rawLevel
- * @param {{trials?:number, strategy?:string, maxMoves?:number, seed?:number, onProgress?:Function, chunkSize?:number, planMaxLen?:number}} options
+ * @param {{trials?:number, strategy?:string, maxMoves?:number, seed?:number, onProgress?:Function, chunkSize?:number}} options
  */
 export async function analyzeLevelAsync(rawLevel, options = {}) {
   const trials = options.trials ?? 200;
@@ -604,12 +796,11 @@ export async function analyzeLevelAsync(rawLevel, options = {}) {
   const maxMoves = options.maxMoves ?? 2500;
   const seed0 = options.seed ?? 42;
   const chunkSize = Math.max(1, options.chunkSize ?? 8);
-  const planMaxLen = options.planMaxLen ?? 4;
   const onProgress = options.onProgress;
 
   const state0 = createState(rawLevel);
   const profile = staticProfile(state0.shelves);
-  const config = { trials, strategy, maxMoves, seed: seed0, planMaxLen };
+  const config = { trials, strategy, maxMoves, seed: seed0 };
 
   const results = [];
   const startedAt = performance.now();
@@ -620,7 +811,6 @@ export async function analyzeLevelAsync(rawLevel, options = {}) {
       strategy,
       maxMoves,
       seed,
-      planMaxLen,
     });
     result.trialIndex = i;
     results.push(result);
@@ -650,49 +840,14 @@ export async function analyzeLevelAsync(rawLevel, options = {}) {
 }
 
 /**
- * Run a contiguous trial index range (for multi-worker splitting).
- * Seeds match analyzeLevelAsync: seed0 + trialIndex * 9973.
- */
-export function runTrialChunk(rawLevel, options = {}) {
-  const {
-    startIndex = 0,
-    count = 1,
-    strategy = "greedy",
-    maxMoves = 2500,
-    seed: seed0 = 42,
-    planMaxLen = 4,
-  } = options;
-
-  const results = [];
-  for (let i = 0; i < count; i += 1) {
-    const trialIndex = startIndex + i;
-    const seed = (seed0 + trialIndex * 9973) >>> 0;
-    const result = playout(rawLevel, {
-      strategy,
-      maxMoves,
-      seed,
-      planMaxLen,
-    });
-    result.trialIndex = trialIndex;
-    results.push(result);
-  }
-  return results;
-}
-
-export function getLevelProfile(rawLevel) {
-  return staticProfile(createState(rawLevel).shelves);
-}
-
-/**
  * @param {any} rawLevel
- * @param {{trials?:number, strategy?:string, maxMoves?:number, seed?:number, planMaxLen?:number}} options
+ * @param {{trials?:number, strategy?:string, maxMoves?:number, seed?:number}} options
  */
 export function analyzeLevel(rawLevel, options = {}) {
   const trials = options.trials ?? 200;
   const strategy = options.strategy ?? "greedy";
   const maxMoves = options.maxMoves ?? 2500;
   const seed0 = options.seed ?? 42;
-  const planMaxLen = options.planMaxLen ?? 4;
 
   const state0 = createState(rawLevel);
   const profile = staticProfile(state0.shelves);
@@ -704,7 +859,6 @@ export function analyzeLevel(rawLevel, options = {}) {
       strategy,
       maxMoves,
       seed,
-      planMaxLen,
     });
     result.trialIndex = i;
     results.push(result);
@@ -715,7 +869,6 @@ export function analyzeLevel(rawLevel, options = {}) {
     strategy,
     maxMoves,
     seed: seed0,
-    planMaxLen,
   });
 }
 

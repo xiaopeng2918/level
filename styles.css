@@ -838,6 +838,63 @@ body.is-dragging .item.movable {
   opacity: 0.75;
 }
 
+.layer-count-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.layer-count-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 7px;
+  border-radius: 8px;
+  background: rgba(15, 61, 62, 0.05);
+  border: 1px solid rgba(15, 61, 62, 0.08);
+}
+
+.layer-count-summary.is-empty {
+  opacity: 0.65;
+}
+
+.layer-count-title {
+  font-size: 0.68rem;
+  font-weight: 800;
+  opacity: 0.7;
+  margin-right: 2px;
+  flex-shrink: 0;
+}
+
+.layer-count-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  background: color-mix(in srgb, var(--item-color) 28%, white);
+  border: 1px solid color-mix(in srgb, var(--item-color) 50%, #333);
+  line-height: 1.2;
+}
+
+.layer-count-chip.is-empty {
+  background: rgba(15, 61, 62, 0.06);
+  border-color: rgba(15, 61, 62, 0.18);
+  color: rgba(15, 61, 62, 0.75);
+}
+
+.layer-count-emoji {
+  font-size: 0.75rem;
+}
+
+.layer-count-n {
+  opacity: 0.85;
+}
+
 .trace-board-mid {
   display: flex;
   align-items: center;
@@ -1123,6 +1180,12 @@ body.is-dragging .item.movable {
   place-items: center;
   padding: 20px;
   z-index: 20;
+  /* Dim the page but let file drag / batch panel receive events */
+  pointer-events: none;
+}
+
+.overlay .modal {
+  pointer-events: auto;
 }
 
 .overlay.hidden,
@@ -1210,6 +1273,8 @@ body.is-dragging .item.movable {
 
 /* —— Batch Excel simulation —— */
 .batch-panel {
+  position: relative;
+  z-index: 25; /* above startup overlay so drag-upload works without dismissing modal */
   background: var(--panel);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
@@ -1219,6 +1284,7 @@ body.is-dragging .item.movable {
 }
 
 .batch-drop {
+  position: relative;
   border: 2px dashed rgba(15, 61, 62, 0.22);
   border-radius: 16px;
   padding: 28px 16px;
@@ -1228,6 +1294,26 @@ body.is-dragging .item.movable {
   display: grid;
   gap: 6px;
   color: var(--ink);
+  overflow: hidden;
+}
+
+/* Native file input covers the zone — most reliable OS file drag target */
+.batch-drop > input[type="file"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+  font-size: 0;
+  z-index: 2;
+}
+
+.batch-drop strong,
+.batch-drop span {
+  position: relative;
+  z-index: 1;
+  pointer-events: none;
 }
 
 .batch-drop strong {

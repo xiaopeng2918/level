@@ -1,4 +1,4 @@
-import { analyzeLevelAsync, playout } from "./analyze.js";
+import { analyzeLevelAsync, playout } from "./analyze.js?v=20260730g";
 
 const TRIPLE_WIDTH = 3;
 const SINGLE_WIDTH = 1;
@@ -1289,7 +1289,8 @@ const REASON_LABEL = {
   match3: "凑三",
   setup3: "首层多步凑三",
   pair: "凑对",
-  stack: "叠同色",
+  digMatch: "翻层可消",
+  digReveal: "多步翻层",
   dig: "翻非末层",
   single: "清单格",
   move: "普通搬",
@@ -1455,7 +1456,15 @@ function renderTraceDetail(summary, traced) {
           <span>#${step.step}</span>
           <span class="trace-reason">${REASON_LABEL[step.reason] || step.reason}</span>
           <span>分 ${step.score}</span>
-          <span>${step.action?.type === "plan" ? `消除 id${step.action.matchType}` : step.text}</span>
+          <span>${
+            step.action?.type === "plan"
+              ? step.action.planKind === "dig"
+                ? step.action.canMatchPrior && step.action.matchIds?.length
+                  ? `翻层可消 id${step.action.matchIds.join(",")}`
+                  : `多步翻层 露出id${(step.action.revealTypes || []).join(",") || "?"}`
+                : `消除 id${step.action.matchType}`
+              : step.text
+          }</span>
           <span>进度 ${pct(step.progress)}</span>
           ${atomicTag}
           ${warn}
@@ -1478,7 +1487,7 @@ function renderTraceDetail(summary, traced) {
       <span class="trial-result trial-${traced.result}">${RESULT_LABEL[traced.result]}</span>
       <span>${traced.moves} 实际移动 · ${traced.logicSteps ?? traced.trace?.length ?? "—"} 逻辑步 · 进度 ${pct(traced.progress)} · seed ${traced.seed}</span>
     </div>
-    <p class="trial-detail-hint">展示按逻辑步；「首层多步凑三」为合成一步，但通关步数按实际移动手数累计。红=移出，绿=放入。</p>
+    <p class="trial-detail-hint">展示按逻辑步；「首层多步凑三 / 翻层可消 / 多步翻层」为合成一步，但通关步数按实际移动手数累计。红=移出，绿=放入。每侧下方汇总第一层 / 前两层各物品数量（含空格）。</p>
     <div class="trace-list">${stepHtml || "<p>无步骤记录</p>"}</div>
   `;
   detailEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -1604,8 +1613,9 @@ function renderMiniBoard(board, hl, phase) {
       const hasNext =
         Array.isArray(nextLayer) && nextLayer.some((id) => id !== 0);
 
+      const layerCount = layers.length;
       const behindLabel = hasNext
-        ? '<span class="mini-behind" title="有次层">次层</span>'
+        ? `<span class="mini-behind" title="剩余 ${layerCount} 层">${layerCount}层</span>`
         : '<span class="mini-behind is-last">末层</span>';
 
       const frontCells = front
@@ -1613,7 +1623,7 @@ function renderMiniBoard(board, hl, phase) {
         .join("");
 
       const peekRow = hasNext
-        ? `<div class="mini-row mini-peek" title="次层">${nextLayer
+        ? `<div class="mini-row mini-peek" title="剩余 ${layerCount} 层">${nextLayer
             .map((id) => renderTraceCell(id, "is-peek"))
             .join("")}</div>`
         : "";
@@ -1630,11 +1640,78 @@ function renderMiniBoard(board, hl, phase) {
   return `<div class="mini-board">${shelves}</div>`;
 }
 
+/** Count every cell in the top `maxLayers` layers across all shelves (includes empty=0). */
+function countTopLayerItems(board, maxLayers = 2) {
+  const counts = new Map();
+  const depth = Math.max(1, maxLayers);
+  for (const shelf of board || []) {
+    const layers =
+      Array.isArray(shelf.layers) && shelf.layers.length
+        ? shelf.layers
+        : [Array.isArray(shelf.front) ? shelf.front : []];
+    for (let li = 0; li < Math.min(depth, layers.length); li += 1) {
+      const layer = layers[li];
+      if (!Array.isArray(layer)) continue;
+      for (const id of layer) {
+        const key = Number(id) || 0;
+        counts.set(key, (counts.get(key) || 0) + 1);
+      }
+    }
+  }
+  return counts;
+}
+
+function renderLayerCountSummary(board, title, maxLayers) {
+  const counts = countTopLayerItems(board, maxLayers);
+  const entries = [...counts.entries()].sort((a, b) => {
+    if (a[0] === 0) return -1;
+    if (b[0] === 0) return 1;
+    return a[0] - b[0];
+  });
+  if (!entries.length) {
+    return `<div class="layer-count-summary is-empty"><span class="layer-count-title">${title}</span><span>无</span></div>`;
+  }
+  const chips = entries
+    .map(([id, n]) => {
+      if (!id) {
+        return `<span class="layer-count-chip is-empty" title="空格数量">空×${n}</span>`;
+      }
+      const visual = visualForId(id);
+      return `<span class="layer-count-chip" style="--item-color:${visual.color}" title="ID ${id}">
+        <span class="layer-count-emoji">${visual.emoji}</span>
+        <span class="layer-count-id">${visual.label}</span>
+        <span class="layer-count-n">×${n}</span>
+      </span>`;
+    })
+    .join("");
+  return `<div class="layer-count-summary"><span class="layer-count-title">${title}</span>${chips}</div>`;
+}
+
+function renderBoardLayerSummaries(board) {
+  return `<div class="layer-count-block">
+    ${renderLayerCountSummary(board, "第一层", 1)}
+    ${renderLayerCountSummary(board, "前两层", 2)}
+  </div>`;
+}
+
 function renderMoveCaption(hl, step) {
   if (hl?.mode === "plan" || step?.action?.type === "plan") {
     const hands = (step.action.moves || [])
       .map((m, i) => `${i + 1}.架${m.fromShelf ?? m.shelf}格${m.fromSlot ?? m.slot}→架${m.toShelf ?? "—"}格${m.toSlot ?? "—"}`)
       .join(" · ");
+    if (step.action.planKind === "dig") {
+      const canClear = step.action.canMatchPrior && step.action.matchIds?.length;
+      const ids = canClear
+        ? step.action.matchIds.join(",")
+        : (step.action.revealTypes || []).join(",") || "?";
+      return `<div class="move-caption">
+      <span>${canClear ? "翻层可消" : "多步翻层"}</span>
+      <span>${canClear ? `可消 id${ids}` : `露出 id${ids}`}</span>
+      <span class="move-arrow">×${step.atomicCount} 手</span>
+      <span class="move-note">合成 1 逻辑步</span>
+      <span class="move-hands">${hands}</span>
+    </div>`;
+    }
     return `<div class="move-caption">
       <span>首层多步凑三</span>
       <span>消除 id${step.action.matchType}</span>
@@ -1673,6 +1750,7 @@ function renderTraceMoveBoards(step) {
     <div class="trace-board-pane">
       <div class="trace-board-label">移动前</div>
       ${renderMiniBoard(step.before, hl, "before")}
+      ${renderBoardLayerSummaries(step.before)}
     </div>
     <div class="trace-board-mid">
       ${renderMoveCaption(hl, step)}
@@ -1680,6 +1758,7 @@ function renderTraceMoveBoards(step) {
     <div class="trace-board-pane">
       <div class="trace-board-label">移动后</div>
       ${renderMiniBoard(step.after, hl, "after")}
+      ${renderBoardLayerSummaries(step.after)}
     </div>
   </div>`;
 }

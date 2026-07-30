@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=Nunito:wght@600;700;800&family=Outfit:wght@500;700;800&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="styles.css?v=20260730g" />
   </head>
   <body>
     <div class="app">
@@ -100,7 +100,7 @@
         <div class="level-panel-head">
           <div>
             <h2>批量关卡模拟</h2>
-            <p>拖入 Excel（含「物品数据 / itemData」）。默认快速模式 + 多核并行；需要更贴近单关「分析难度」时取消勾选快速模式。</p>
+            <p>拖入 Excel（含「物品数据 / itemData」）。每关默认模拟 20 局（原版贪心+多步凑三），结果写回对应行并可下载。</p>
           </div>
           <div class="level-panel-actions">
             <label class="trials-label" for="batchTrials">
@@ -115,10 +115,6 @@
                 value="20"
               />
             </label>
-            <label class="trials-label" for="batchFastMode" title="关闭多步凑三搜索，并用多核并行。结果与精确模式可能略有差异。">
-              <input id="batchFastMode" type="checkbox" checked />
-              快速模式
-            </label>
             <button class="primary-btn" id="btnBatchStart" type="button" disabled>开始批量模拟</button>
             <button class="ghost-btn" id="btnBatchStop" type="button" disabled>停止</button>
             <button class="ghost-btn" id="btnBatchDownload" type="button" disabled>下载结果表</button>
@@ -126,9 +122,9 @@
         </div>
 
         <div id="batchDrop" class="batch-drop" tabindex="0">
+          <input id="batchFile" type="file" accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" />
           <strong>拖拽 .xlsx 到此处</strong>
           <span>或点击选择文件</span>
-          <input id="batchFile" type="file" accept=".xlsx,.xls" hidden />
         </div>
         <p id="batchStatus" class="batch-status">等待上传表格…</p>
         <div id="batchProgress" class="analyze-progress" hidden>
@@ -154,7 +150,25 @@
       </div>
     </div>
 
-    <script type="module" src="game.js?v=20260728b"></script>
-    <script type="module" src="batch.js?v=20260728b"></script>
+    <script type="module" src="game.js?v=20260730g"></script>
+    <script type="module">
+      import("/batch.js?v=20260730g").catch((err) => {
+        const el = document.getElementById("batchStatus");
+        if (el) el.textContent = "批量脚本加载失败：" + (err && err.message ? err.message : err);
+        console.error(err);
+      });
+    </script>
+    <script>
+      window.addEventListener("load", function () {
+        setTimeout(function () {
+          var status = document.getElementById("batchStatus");
+          if (!status) return;
+          if (!window.__BATCH_BOUND__ && /等待上传表格/.test(status.textContent || "")) {
+            status.textContent =
+              "批量脚本未加载。请强制刷新（Cmd+Shift+R），或确认打开的是 http://localhost:5173/";
+          }
+        }, 2000);
+      });
+    </script>
   </body>
 </html>
