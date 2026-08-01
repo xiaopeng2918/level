@@ -539,6 +539,92 @@ body.is-dragging .item.movable {
   border-color: transparent;
 }
 
+.sim-ops-panel {
+  margin: 10px 0 12px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(15, 61, 62, 0.04);
+  border: 1px solid rgba(15, 61, 62, 0.08);
+}
+
+.sim-ops-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px 12px;
+  margin-bottom: 10px;
+}
+
+.sim-ops-head h3 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.sim-ops-head p {
+  margin: 4px 0 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.sim-ops-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.sim-ops-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+  gap: 8px;
+}
+
+.sim-op-item {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 8px;
+  align-items: start;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(15, 61, 62, 0.08);
+  cursor: pointer;
+}
+
+.sim-op-item input {
+  margin-top: 3px;
+}
+
+.sim-op-label {
+  font-size: 0.84rem;
+  font-weight: 800;
+  color: var(--ink);
+}
+
+.sim-op-scene {
+  grid-column: 2;
+  font-size: 0.74rem;
+  line-height: 1.35;
+  color: var(--muted);
+}
+
+.sim-op-score {
+  grid-column: 2;
+  font-size: 0.72rem;
+  line-height: 1.35;
+  color: var(--ink);
+  opacity: 0.82;
+  margin-top: 2px;
+  padding-top: 4px;
+  border-top: 1px dashed rgba(15, 61, 62, 0.12);
+}
+
+.sim-op-score strong {
+  color: var(--accent, #ff7a45);
+  font-weight: 800;
+  margin-right: 2px;
+}
+
 .level-input {
   width: 100%;
   min-height: 120px;
@@ -705,6 +791,16 @@ body.is-dragging .item.movable {
   font-variant-numeric: tabular-nums;
 }
 
+.trial-pattern {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: #0f3d3e;
+  background: rgba(15, 61, 62, 0.08);
+  border-radius: 6px;
+  padding: 0 6px;
+  font-size: 0.85em;
+}
+
 .trial-result {
   font-weight: 700;
 }
@@ -800,6 +896,16 @@ body.is-dragging .item.movable {
   color: var(--accent, #ff7a45);
 }
 
+.trace-reveal {
+  font-variant-numeric: tabular-nums;
+  color: #0f3d3e;
+}
+
+.trace-reveal.is-scarce {
+  font-weight: 700;
+  color: #9a6700;
+}
+
 .trial-warn {
   color: #9a6700;
   font-weight: 700;
@@ -832,10 +938,22 @@ body.is-dragging .item.movable {
 }
 
 .trace-board-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   font-size: 0.75rem;
   font-weight: 800;
   margin-bottom: 6px;
   opacity: 0.75;
+}
+
+.mini-copy-btn {
+  font-size: 0.68rem;
+  font-weight: 700;
+  padding: 2px 8px;
+  opacity: 1;
+  flex-shrink: 0;
 }
 
 .layer-count-block {

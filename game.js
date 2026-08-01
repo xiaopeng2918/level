@@ -1,4 +1,5 @@
-import { analyzeLevelAsync, playout } from "./analyze.js?v=20260730g";
+import { analyzeLevelAsync, playout, SIM_OP_DEFS, defaultEnabledOps, normalizeEnabledOps } from "./analyze.js?v=20260801k";
+import { analyzeLevelOffMain } from "./analyze-client.js?v=20260801k";
 
 const TRIPLE_WIDTH = 3;
 const SINGLE_WIDTH = 1;
@@ -181,6 +182,9 @@ const els = {
   levelInput: document.getElementById("levelInput"),
   levelError: document.getElementById("levelError"),
   analyzeResult: document.getElementById("analyzeResult"),
+  simOpsList: document.getElementById("simOpsList"),
+  btnSimOpsAll: document.getElementById("btnSimOpsAll"),
+  btnSimOpsNone: document.getElementById("btnSimOpsNone"),
   overlay: document.getElementById("overlay"),
   modalKicker: document.getElementById("modalKicker"),
   modalTitle: document.getElementById("modalTitle"),
@@ -1284,13 +1288,72 @@ const RESULT_LABEL = {
   limit: "步数上限",
 };
 
+const SIM_OPS_STORAGE_KEY = "goods-sort-sim-ops-v1";
+
+function loadStoredEnabledOps() {
+  try {
+    const raw = localStorage.getItem(SIM_OPS_STORAGE_KEY);
+    if (!raw) return defaultEnabledOps();
+    return normalizeEnabledOps(JSON.parse(raw));
+  } catch {
+    return defaultEnabledOps();
+  }
+}
+
+function saveEnabledOps(ops) {
+  try {
+    localStorage.setItem(SIM_OPS_STORAGE_KEY, JSON.stringify(ops));
+  } catch {
+    /* ignore quota */
+  }
+}
+
+function readEnabledOpsFromUi() {
+  if (!els.simOpsList) return defaultEnabledOps();
+  const ops = defaultEnabledOps();
+  els.simOpsList.querySelectorAll('input[data-sim-op]').forEach((input) => {
+    ops[input.dataset.simOp] = input.checked;
+  });
+  return normalizeEnabledOps(ops);
+}
+
+function renderSimOpsPanel() {
+  if (!els.simOpsList) return;
+  const enabled = loadStoredEnabledOps();
+  els.simOpsList.innerHTML = SIM_OP_DEFS.map(
+    (op) => `<label class="sim-op-item">
+      <input type="checkbox" data-sim-op="${op.id}" ${enabled[op.id] ? "checked" : ""} />
+      <span class="sim-op-label">${op.label}</span>
+      <span class="sim-op-scene">${op.scene}</span>
+      <span class="sim-op-score"><strong>分值</strong> ${op.score}</span>
+    </label>`,
+  ).join("");
+}
+
+function setAllSimOps(checked) {
+  if (!els.simOpsList) return;
+  els.simOpsList.querySelectorAll('input[data-sim-op]').forEach((input) => {
+    input.checked = checked;
+  });
+  saveEnabledOps(readEnabledOpsFromUi());
+}
+
+function enabledOpsSummary(ops) {
+  const on = SIM_OP_DEFS.filter((op) => ops[op.id]).map((op) => op.label);
+  if (on.length === SIM_OP_DEFS.length) return "全部操作";
+  if (!on.length) return "无操作";
+  return on.join("、");
+}
+
 const REASON_LABEL = {
   special: "点999",
   match3: "凑三",
   setup3: "首层多步凑三",
+  setupReveal: "选架翻层",
   pair: "凑对",
   digMatch: "翻层可消",
   digReveal: "多步翻层",
+  digLayer: "露出下层",
   dig: "翻非末层",
   single: "清单格",
   move: "普通搬",
@@ -1306,6 +1369,8 @@ const analyzeSession = {
   filter: "all",
   page: 0,
   selectedIndex: null,
+  /** @type {Array<{before:any,after:any}>|null} */
+  traceBoards: null,
 };
 
 function readAnalyzeTrials() {
@@ -1355,13 +1420,26 @@ function renderTrialListOnly() {
   const start = analyzeSession.page * TRIAL_PAGE_SIZE;
   const slice = rows.slice(start, start + TRIAL_PAGE_SIZE);
 
-  if (countEl) countEl.textContent = `共 ${rows.length} 局`;
+  if (countEl) {
+    const types = analyzeSession.report?.summary?.patternTypes;
+    countEl.textContent =
+      types != null
+        ? `共 ${rows.length} 局 · ${types} 种独立路径`
+        : `共 ${rows.length} 局`;
+  }
 
   listEl.innerHTML = slice
     .map((r) => {
       const active = analyzeSession.selectedIndex === r.trialIndex ? " is-active" : "";
+      const pattern =
+        r.patternId != null
+          ? `<span class="trial-pattern" title="相同路径枚举；同型 ${r.patternCount || 1} 局">型${r.patternId}${
+              (r.patternCount || 1) > 1 ? `×${r.patternCount}` : ""
+            }</span>`
+          : "";
       return `<button type="button" class="trial-row${active}" data-trial="${r.trialIndex}">
         <span class="trial-id">#${r.trialIndex}</span>
+        ${pattern}
         <span class="trial-result trial-${r.result}">${RESULT_LABEL[r.result] || r.result}</span>
         <span>${r.moves} 步</span>
         <span>进度 ${pct(r.progress)}</span>
@@ -1387,7 +1465,7 @@ function renderAnalyzeReport(report) {
     <div class="analyze-head">
       <strong>难度 ${s.difficulty}</strong>
       <span class="analyze-tier">${s.tier}</span>
-      <span class="analyze-meta">贪心 · ${report.config.trials} 局 · 仅移动</span>
+      <span class="analyze-meta">贪心 · ${report.config.trials} 局 · 仅移动 · ${enabledOpsSummary(normalizeEnabledOps(report.config.enabledOps))}</span>
     </div>
     <ul class="analyze-stats">
       <li>通关率 <strong>${pct(s.winRate)}</strong></li>
@@ -1424,6 +1502,10 @@ function renderAnalyzeReport(report) {
   const filterEl = document.getElementById("trialFilter");
   if (filterEl) filterEl.value = analyzeSession.filter;
   renderTrialListOnly();
+  const listEl = document.getElementById("trialList");
+  if (listEl && !(report.results || []).length) {
+    listEl.innerHTML = `<p class="trial-empty">暂无单局数据。请硬刷新页面后重新分析。</p>`;
+  }
 }
 
 function renderTraceDetail(summary, traced) {
@@ -1431,8 +1513,12 @@ function renderTraceDetail(summary, traced) {
   if (!detailEl) return;
 
   const steps = traced.trace || [];
+  analyzeSession.traceBoards = steps.map((step) => ({
+    before: step.before,
+    after: step.after,
+  }));
   const stepHtml = steps
-    .map((step) => {
+    .map((step, stepIndex) => {
       const top = (step.top || [])
         .map(
           (c) =>
@@ -1450,7 +1536,7 @@ function renderTraceDetail(summary, traced) {
       const subBlock = submoves
         ? `<div class="trace-submoves"><p>子步骤（计入通关步数）：</p><ol>${submoves}</ol></div>`
         : "";
-      const boards = renderTraceMoveBoards(step);
+      const boards = renderTraceMoveBoards(step, stepIndex);
       return `<details class="trace-step">
         <summary>
           <span>#${step.step}</span>
@@ -1466,6 +1552,13 @@ function renderTraceDetail(summary, traced) {
               : step.text
           }</span>
           <span>进度 ${pct(step.progress)}</span>
+          <span class="trace-reveal${step.revealScarce ? " is-scarce" : ""}" title="暴露机会=⌊空位/3⌋+首层可消组数">
+            暴露 ${
+              step.revealChancesBefore != null && step.revealChancesBefore !== step.revealChances
+                ? `${step.revealChancesBefore}→${step.revealChances}`
+                : (step.revealChances ?? "—")
+            }${step.revealScarce ? "·稀缺" : ""}
+          </span>
           ${atomicTag}
           ${warn}
         </summary>
@@ -1484,10 +1577,17 @@ function renderTraceDetail(summary, traced) {
   detailEl.innerHTML = `
     <div class="trial-detail-head">
       <strong>局 #${summary.trialIndex}</strong>
+      ${
+        summary.patternId != null
+          ? `<span class="trial-pattern">型${summary.patternId}${
+              (summary.patternCount || 1) > 1 ? `×${summary.patternCount}` : ""
+            }</span>`
+          : ""
+      }
       <span class="trial-result trial-${traced.result}">${RESULT_LABEL[traced.result]}</span>
       <span>${traced.moves} 实际移动 · ${traced.logicSteps ?? traced.trace?.length ?? "—"} 逻辑步 · 进度 ${pct(traced.progress)} · seed ${traced.seed}</span>
     </div>
-    <p class="trial-detail-hint">展示按逻辑步；「首层多步凑三 / 翻层可消 / 多步翻层」为合成一步，但通关步数按实际移动手数累计。红=移出，绿=放入。每侧下方汇总第一层 / 前两层各物品数量（含空格）。</p>
+    <p class="trial-detail-hint">「型N」按逐步着法路径指纹枚举，路径相同则共用同一型号。「暴露」为该步前后剩余暴露新层机会（⌊空位/3⌋+首层可消组数；≤2 且仍有下层时为稀缺）。展示按逻辑步；合成一步按实际移动手数累计。红=移出，绿=放入。可用「复制」导出前两层三维数组。</p>
     <div class="trace-list">${stepHtml || "<p>无步骤记录</p>"}</div>
   `;
   detailEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -1664,9 +1764,10 @@ function countTopLayerItems(board, maxLayers = 2) {
 function renderLayerCountSummary(board, title, maxLayers) {
   const counts = countTopLayerItems(board, maxLayers);
   const entries = [...counts.entries()].sort((a, b) => {
+    // Empty (0) always first; other ids by count desc, then id asc.
     if (a[0] === 0) return -1;
     if (b[0] === 0) return 1;
-    return a[0] - b[0];
+    return b[1] - a[1] || a[0] - b[0];
   });
   if (!entries.length) {
     return `<div class="layer-count-summary is-empty"><span class="layer-count-title">${title}</span><span>无</span></div>`;
@@ -1744,11 +1845,59 @@ function renderMoveCaption(hl, step) {
   </div>`;
 }
 
-function renderTraceMoveBoards(step) {
+/**
+ * Export displayed board (at most first + second layer) as level 3D array:
+ * [ shelf[ layer[ id, ... ], ... ], ... ]
+ */
+function boardToTopTwoLevelArray(board) {
+  return (board || []).map((shelf) => {
+    const width = shelf.w || shelf.front?.length || 3;
+    const layers =
+      Array.isArray(shelf.layers) && shelf.layers.length
+        ? shelf.layers
+        : [Array.isArray(shelf.front) ? shelf.front : Array.from({ length: width }, () => 0)];
+    const out = [];
+    for (let i = 0; i < Math.min(2, layers.length); i += 1) {
+      const layer = layers[i];
+      out.push(Array.isArray(layer) ? layer.map((id) => Number(id) || 0) : Array.from({ length: width }, () => 0));
+    }
+    if (!out.length) out.push(Array.from({ length: width }, () => 0));
+    return out;
+  });
+}
+
+async function copyBoardTopTwoLayers(stepIndex, phase, buttonEl) {
+  const entry = analyzeSession.traceBoards?.[stepIndex];
+  const board = phase === "after" ? entry?.after : entry?.before;
+  if (!board) {
+    setLevelError("没有可复制的局面数据");
+    return;
+  }
+  const text = JSON.stringify(boardToTopTwoLevelArray(board));
+  try {
+    await navigator.clipboard.writeText(text);
+    if (buttonEl) {
+      const prev = buttonEl.textContent;
+      buttonEl.textContent = "已复制";
+      buttonEl.disabled = true;
+      setTimeout(() => {
+        buttonEl.textContent = prev;
+        buttonEl.disabled = false;
+      }, 1200);
+    }
+  } catch (err) {
+    setLevelError(`复制失败：${err?.message || err}`);
+  }
+}
+
+function renderTraceMoveBoards(step, stepIndex) {
   const hl = normalizeHighlight(step);
   return `<div class="trace-boards">
     <div class="trace-board-pane">
-      <div class="trace-board-label">移动前</div>
+      <div class="trace-board-label">
+        <span>移动前</span>
+        <button type="button" class="ghost-btn mini-copy-btn" data-copy-step="${stepIndex}" data-copy-phase="before" title="复制前两层为三维数组">复制</button>
+      </div>
       ${renderMiniBoard(step.before, hl, "before")}
       ${renderBoardLayerSummaries(step.before)}
     </div>
@@ -1756,7 +1905,10 @@ function renderTraceMoveBoards(step) {
       ${renderMoveCaption(hl, step)}
     </div>
     <div class="trace-board-pane">
-      <div class="trace-board-label">移动后</div>
+      <div class="trace-board-label">
+        <span>移动后</span>
+        <button type="button" class="ghost-btn mini-copy-btn" data-copy-step="${stepIndex}" data-copy-phase="after" title="复制前两层为三维数组">复制</button>
+      </div>
       ${renderMiniBoard(step.after, hl, "after")}
       ${renderBoardLayerSummaries(step.after)}
     </div>
@@ -1782,6 +1934,7 @@ async function openTrialTrace(trialIndex) {
     strategy: analyzeSession.report.config.strategy,
     maxMoves: analyzeSession.report.config.maxMoves,
     seed: summary.seed,
+    enabledOps: analyzeSession.report.config.enabledOps,
     trace: true,
     topK: 5,
   });
@@ -1814,14 +1967,38 @@ async function runDifficultyAnalysis() {
   await new Promise((r) => setTimeout(r, 30));
 
   try {
-    const report = await analyzeLevelAsync(raw, {
+    const enabledOps = readEnabledOpsFromUi();
+    saveEnabledOps(enabledOps);
+    const report = await analyzeLevelOffMain(raw, {
       trials,
       strategy: "greedy",
-      maxMoves: 5000,
+      maxMoves: 2500,
       seed: 42,
-      chunkSize: trials > 2000 ? 20 : 8,
+      enabledOps,
+      slimResults: false,
+      chunkSize: trials > 2000 ? 20 : 4,
       onProgress: renderAnalyzeProgress,
     });
+
+    if (!report?.results?.length) {
+      // Fallback if an old worker still stripped results.
+      const full = await analyzeLevelAsync(raw, {
+        trials,
+        strategy: "greedy",
+        maxMoves: 2500,
+        seed: 42,
+        enabledOps,
+        chunkSize: trials > 2000 ? 20 : 4,
+        onProgress: renderAnalyzeProgress,
+      });
+      analyzeSession.raw = raw;
+      analyzeSession.report = full;
+      analyzeSession.filter = "all";
+      analyzeSession.page = 0;
+      analyzeSession.selectedIndex = null;
+      renderAnalyzeReport(full);
+      return;
+    }
 
     analyzeSession.raw = raw;
     analyzeSession.report = report;
@@ -1854,6 +2031,18 @@ els.analyzeResult?.addEventListener("change", (event) => {
 });
 
 els.analyzeResult?.addEventListener("click", (event) => {
+  const copyBtn = event.target.closest(".mini-copy-btn");
+  if (copyBtn) {
+    event.preventDefault();
+    event.stopPropagation();
+    copyBoardTopTwoLayers(
+      Number(copyBtn.dataset.copyStep),
+      copyBtn.dataset.copyPhase,
+      copyBtn,
+    ).catch((err) => setLevelError(err.message || String(err)));
+    return;
+  }
+
   const pageBtn = event.target.closest(".trial-page-btn");
   if (pageBtn) {
     analyzeSession.page += Number(pageBtn.dataset.dir);
@@ -1878,6 +2067,15 @@ els.btnAnalyze.addEventListener("click", () => {
 });
 els.btnLoadLevel.addEventListener("click", () => loadFromInput({ autoStart: true }));
 
+els.btnSimOpsAll?.addEventListener("click", () => setAllSimOps(true));
+els.btnSimOpsNone?.addEventListener("click", () => setAllSimOps(false));
+els.simOpsList?.addEventListener("change", (event) => {
+  if (event.target?.matches?.("input[data-sim-op]")) {
+    saveEnabledOps(readEnabledOpsFromUi());
+  }
+});
+
+renderSimOpsPanel();
 fillSample();
 
 try {

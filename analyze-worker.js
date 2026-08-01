@@ -1,7 +1,7 @@
 /**
  * Off-main-thread Monte Carlo analysis for batch (and any UI caller).
  */
-import { analyzeLevelAsync } from "./analyze.js?v=20260730d";
+import { analyzeLevelAsync } from "./analyze.js?v=20260801k";
 
 function slimReport(report) {
   if (!report) return report;
@@ -21,6 +21,7 @@ self.onmessage = async (event) => {
       maxMoves: options.maxMoves,
       seed: options.seed,
       chunkSize: options.chunkSize ?? 1,
+      enabledOps: options.enabledOps,
       onProgress: (p) => {
         self.postMessage({
           type: "progress",
@@ -33,7 +34,9 @@ self.onmessage = async (event) => {
         });
       },
     });
-    self.postMessage({ type: "result", id, report: slimReport(report) });
+    // Default keep full report; batch opts into slimResults to shrink transfer.
+    const out = options.slimResults ? slimReport(report) : report;
+    self.postMessage({ type: "result", id, report: out });
   } catch (err) {
     self.postMessage({
       type: "error",

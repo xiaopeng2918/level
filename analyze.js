@@ -18,7 +18,109 @@ import {
   hashShelves,
   hasContentBehind,
   isLayerMatched,
+  canPlaceOnShelf,
 } from "./engine.js";
+
+/** Selectable greedy simulation operations (reason ids). */
+export const SIM_OP_DEFS = [
+  {
+    id: "special",
+    label: "点999",
+    scene: "场上有特殊清除格 999 时，优先单击消去，为腾空位或翻层做准备。",
+    score: "固定 1000 分（最高优先，出现即优先点）。",
+  },
+  {
+    id: "match3",
+    label: "凑三",
+    scene: "单步把物品搬到目标架后，该架首层立刻形成三个相同并消除。",
+    score: "固定 +800。机会充裕时与多步凑三同分并随机选组；暴露机会稀缺（≤2）时才叠下层/留空等区别分。通关 +500；消后无着 −5000。",
+  },
+  {
+    id: "setup3",
+    label: "首层多步凑三",
+    scene: "首层已有至少 3 个同色但分散在不同架，用多步把它们凑到同一架再消除。",
+    score: "固定 +800。有可走首层凑三时优先于翻层；优先只消一架的落点。稀缺时按下层空位等区别打分。通关 +500；消后无着 −5000。",
+  },
+  {
+    id: "setupReveal",
+    label: "选架翻层",
+    scene: "独立策略：非稀缺时也可按下层质量选凑三落点；稀缺时首层多步凑三本身就会按消架选层。暴露机会≈⌊空位/3⌋+首层可消组数。",
+    score: "不单独成步；稀缺时放大下层质量分。非稀缺且关闭时，凑三保持同分随机。",
+  },
+  {
+    id: "pair",
+    label: "凑对",
+    scene: "搬到已有一个同色的空位，先凑成一对，为后续凑三铺路。",
+    score: "单步原子搬移：+80。可与翻层/单格/留空等加分叠加。",
+  },
+  {
+    id: "digMatch",
+    label: "翻层可消",
+    scene: "清空非末层货架的首层后露出下层，且露出的物品能与首层已有同色凑成可消。",
+    score: "合成计划：非稀缺 760−手数×45；稀缺固定 760。可叠下层空位/凑对且两层≥3。通关 +500；无着/无空 −5000。单步碰巧翻开可消 +220。",
+  },
+  {
+    id: "digReveal",
+    label: "多步翻层",
+    scene: "清空非末层货架的首层并露出下层，但当前还不能立刻消除（纯翻层推进）。",
+    score: "合成计划：非稀缺 400−手数×40；稀缺固定 400。优先翻出能与全场首层凑对、且该色在全场首层+全场下一层合计≥3。通关 +500；无着/无空 −5000。",
+  },
+  {
+    id: "digLayer",
+    label: "露出下层",
+    scene: "只要清空首层并成功露出下一层即可，不判断翻开后能不能立刻消除（可消与不可消都算）。",
+    score: "不单独计分；勾选后允许任意翻层计划，具体分值仍按「翻层可消」或「多步翻层」计算。",
+  },
+  {
+    id: "dig",
+    label: "翻非末层",
+    scene: "从还有下层的货架往外搬，本步尚未翻开下层，属于翻层过程中的中间搬移。",
+    score: "单步原子搬移：+30（源架有下层但本步未翻开）。可与凑对/留空等叠加。",
+  },
+  {
+    id: "single",
+    label: "清单格",
+    scene: "从宽度为 1、只出不进的货架往外搬物品，优先腾出单格货架。",
+    score: "单步原子搬移：+20（源架宽度为 1）。可与其它加分叠加。",
+  },
+  {
+    id: "move",
+    label: "普通搬",
+    scene: "不属于以上策略的普通货架间搬移，作为低优先级兜底候选。",
+    score: "基础分多为 0；若目标架搬后仍留空位，每个空位 +3（留空加分）。",
+  },
+];
+
+export function defaultEnabledOps() {
+  return Object.fromEntries(SIM_OP_DEFS.map((op) => [op.id, true]));
+}
+
+export function normalizeEnabledOps(input) {
+  const base = defaultEnabledOps();
+  if (!input || typeof input !== "object") return base;
+  for (const op of SIM_OP_DEFS) {
+    if (Object.prototype.hasOwnProperty.call(input, op.id)) {
+      base[op.id] = Boolean(input[op.id]);
+    }
+  }
+  return base;
+}
+
+function isOpEnabled(enabledOps, reason) {
+  if (reason === "random" || reason === "fallback") return true;
+  // 「露出下层」是翻层总开关：允许翻层可消与多步翻层两类结果。
+  if ((reason === "digMatch" || reason === "digReveal") && enabledOps.digLayer) {
+    return true;
+  }
+  // setupReveal is a modifier, not a standalone move reason.
+  if (reason === "setupReveal") return enabledOps.setupReveal !== false;
+  if (!Object.prototype.hasOwnProperty.call(enabledOps, reason)) return true;
+  return enabledOps[reason] !== false;
+}
+
+function wantsSetupReveal(enabledOps) {
+  return !enabledOps || enabledOps.setupReveal !== false;
+}
 
 function rng(seed) {
   let s = seed >>> 0;
@@ -57,6 +159,58 @@ function countTypeAll(shelves, typeId) {
   return n;
 }
 
+/**
+ * Remaining expose-new-layer chances:
+ * - digChances: ⌊placeable empties / 3⌋（每 3 空位算可搬空翻一层）
+ * - matchGroups: front-visible eliminable triples (⌊count/3⌋ per id)
+ */
+export function estimateRevealChances(shelves) {
+  const empties = countPlaceableEmpties(shelves);
+  const digChances = Math.floor(empties / 3);
+
+  let diggable = 0;
+  for (const shelf of shelves) {
+    if (hasContentBehind(shelf)) diggable += 1;
+  }
+
+  let matchGroups = 0;
+  for (const n of countFrontTypes(shelves).values()) {
+    matchGroups += Math.floor(n / 3);
+  }
+
+  const chances = digChances + matchGroups;
+  return {
+    chances,
+    empties,
+    diggable,
+    digChances,
+    matchGroups,
+  };
+}
+
+export function isRevealScarce(shelves) {
+  const { chances, diggable } = estimateRevealChances(shelves);
+  return diggable > 0 && chances <= 2;
+}
+
+/** Static quality of a yet-to-be-exposed next layer: empty slots only. */
+function scorePeekLayer(_shelves, peek) {
+  if (!peek || !peek.length) return 0;
+  return peek.filter((id) => id === 0).length * 28;
+}
+
+/** Apply scarce-reveal multiplier on layer quality (no best/worst layer bonus). */
+function applyScarceRevealAdjust(_shelves, score, parts, ev) {
+  if (!ev?.reveals?.length) return { score, parts };
+  const mult = 3;
+  const baseBonus = ev.revealBonus || 0;
+  // revealBonus already added by caller once; add the extra (mult-1)× here
+  const extra = baseBonus * (mult - 1);
+  score += extra;
+  parts = [...parts, `稀缺选层×${mult}`];
+  return { score, parts };
+}
+
 function frontTripleTypes(shelves) {
   const set = new Set();
   for (const [id, n] of countFrontTypes(shelves)) {
@@ -72,7 +226,43 @@ function matchedTypeId(before, after, typeSet) {
   return null;
 }
 
-function quickFrontSetupScore(shelves, action, typeSet) {
+function peekEmptyCount(shelf) {
+  const peek = shelf?.layers?.[1];
+  if (!peek) return 0;
+  return peek.filter((id) => id === 0).length;
+}
+
+/** Rank diggable shelves by lower-layer empties (+ already holding match types). */
+function promisingClearShelves(shelves, typeSet = null, limit = 3) {
+  const rows = [];
+  for (let i = 0; i < shelves.length; i += 1) {
+    if (!hasContentBehind(shelves[i])) continue;
+    const empties = peekEmptyCount(shelves[i]);
+    if (empties <= 0) continue;
+    const layer = frontLayer(shelves[i]) || [];
+    let typeHits = 0;
+    if (typeSet?.size) {
+      for (const id of layer) {
+        if (typeSet.has(id)) typeHits += 1;
+      }
+    }
+    rows.push({ shelf: i, empties, typeHits });
+  }
+  rows.sort(
+    (a, b) =>
+      b.empties - a.empties || b.typeHits - a.typeHits || a.shelf - b.shelf,
+  );
+  return rows.slice(0, limit);
+}
+
+function quickFrontSetupScore(
+  shelves,
+  action,
+  typeSet,
+  useRevealPick = true,
+  scarce = false,
+  preferShelf = -1,
+) {
   if (action.type === "special" || !typeSet.size) return 0;
   let score = 0;
   const layer = frontLayer(shelves[action.toShelf]);
@@ -92,6 +282,36 @@ function quickFrontSetupScore(shelves, action, typeSet) {
       if (srcLayer.filter((id) => id === t).length >= 2) score += 140;
     }
   }
+  if (!useRevealPick) return score;
+
+  // Prefer assembling on shelves whose next layer has empties (current quality metric).
+  const dest = shelves[action.toShelf];
+  if (dest && hasContentBehind(dest) && dest.layers[1]) {
+    const destEmpties = peekEmptyCount(dest);
+    const destFactor = scarce ? 2.5 : 1;
+    if (destEmpties > 0) {
+      score += Math.round(destEmpties * 28 * destFactor);
+      if (typeSet.has(action.id)) score += Math.round(destEmpties * 40 * destFactor);
+    } else if (typeSet.has(action.id)) {
+      score += Math.round(20 * destFactor);
+    }
+  }
+
+  // Scarce: evacuating non-match off a peek-with-empties shelf frees a clear target.
+  if (scarce && action.type === "move") {
+    const src = shelves[action.fromShelf];
+    if (src && hasContentBehind(src) && !typeSet.has(action.id)) {
+      const srcEmpties = peekEmptyCount(src);
+      if (srcEmpties > 0) score += 50 + srcEmpties * 60;
+    }
+  }
+
+  // Seeded search: strongly prefer building the match on a chosen clear shelf.
+  if (preferShelf >= 0 && action.type === "move") {
+    if (action.toShelf === preferShelf && typeSet.has(action.id)) score += 220;
+    if (action.fromShelf === preferShelf && !typeSet.has(action.id)) score += 200;
+    if (action.fromShelf === preferShelf && typeSet.has(action.id)) score -= 80;
+  }
   return score;
 }
 
@@ -102,64 +322,313 @@ function actionKey(action) {
   return `m:${action.fromShelf}:${action.fromSlot}:${action.toShelf}:${action.toSlot}:${action.id}`;
 }
 
-/** Macro plans: 2..maxLen atomic moves that eliminate a front-visible triple. */
-function findFrontMatchPlans(shelves, maxLen = 4) {
+/** Macro plans: 2..maxLen atomic moves that eliminate a front-visible triple.
+ *  When setupReveal is on, prefers clearing on shelves whose lower layer helps next.
+ */
+function findFrontMatchPlans(shelves, maxLen = 4, enabledOps = null, random = null) {
   const typeSet = frontTripleTypes(shelves);
   if (!typeSet.size) return [];
+  const useRevealPick = wantsSetupReveal(enabledOps);
+  const scarce = isRevealScarce(shelves);
+  // 稀缺时首层多步凑三也必须按「消在哪架/翻哪层」区分，不依赖选架翻层开关。
+  const pickClearShelf = useRevealPick || scarce;
+  const effectiveMax = scarce ? Math.max(maxLen, 6) : maxLen;
 
   const plans = [];
-  const branchAt = [14, 10, 8, 6];
+  // Keep branching modest — this runs every logic step. Scarce: deeper / wider for 选层.
+  const branchAt = scarce
+    ? [12, 10, 8, 6, 5, 4]
+    : pickClearShelf
+      ? [10, 8, 6, 5]
+      : [8, 6, 5, 4];
+  const planCap = scarce ? 48 : pickClearShelf ? 24 : 12;
 
-  function dfs(state, path) {
-    if (path.length >= maxLen) return;
+  function clearShelvesOf(before, after) {
+    const out = [];
+    for (let i = 0; i < before.length; i += 1) {
+      if ((before[i]?.layers?.length || 0) > (after[i]?.layers?.length || 0)) out.push(i);
+    }
+    return out;
+  }
+
+  function dfs(state, path, preferShelf = -1, localCap = planCap) {
+    if (plans.length >= localCap) return;
+    if (path.length >= effectiveMax) return;
     const depth = path.length;
     const ranked = listActions(state)
-      .map((a) => ({ a, s: quickFrontSetupScore(state, a, typeSet) }))
+      .map((a) => ({
+        a,
+        s: quickFrontSetupScore(state, a, typeSet, pickClearShelf, scarce, preferShelf),
+      }))
       .sort((x, y) => y.s - x.s)
-      .slice(0, branchAt[depth] ?? 6);
+      .slice(0, branchAt[depth] ?? 4);
 
     for (const { a } of ranked) {
+      if (plans.length >= localCap) break;
       const next = cloneShelves(state);
       if (!applyAction(next, a)) continue;
       const newPath = path.concat([a]);
       const got = matchedTypeId(shelves, next, typeSet);
       if (got != null) {
         if (newPath.length >= 2) {
+          const clearShelves = clearShelvesOf(shelves, next);
+          // Seeded runs only keep plans that actually clear the preferred shelf.
+          if (preferShelf >= 0 && !clearShelves.includes(preferShelf)) {
+            continue;
+          }
           plans.push({
             type: "plan",
+            planKind: "setup3",
             moves: newPath.map((m) => ({ ...m })),
             matchType: got,
             atomicCount: newPath.length,
+            clearShelves,
           });
         }
         continue;
       }
-      if (newPath.length < maxLen) dfs(next, newPath);
+      if (newPath.length < effectiveMax) dfs(next, newPath, preferShelf, localCap);
     }
   }
 
-  dfs(shelves, []);
-  plans.sort((a, b) => a.atomicCount - b.atomicCount || a.matchType - b.matchType);
+  // Scarce/选架: seed high-value clear shelves FIRST so planCap is not filled by easy 架0 paths.
+  if (pickClearShelf) {
+    const seeds = promisingClearShelves(shelves, typeSet, scarce ? 5 : 3);
+    const perSeed = scarce ? 8 : 5;
+    for (const row of seeds) {
+      if (plans.length >= planCap) break;
+      const seedCap = Math.min(planCap, plans.length + perSeed);
+      dfs(shelves, [], row.shelf, seedCap);
+    }
+  }
+  dfs(shelves, [], -1, planCap);
+
+  // Shuffle so each match-type group keeps a random hand-count variant (手数不计分).
+  if (random && plans.length > 1) {
+    for (let i = plans.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(random() * (i + 1));
+      [plans[i], plans[j]] = [plans[j], plans[i]];
+    }
+  }
+
+  const ranked = plans
+    .map((plan) => {
+      const scored = scorePlan(plan, shelves, enabledOps);
+      return { plan, ...scored };
+    })
+    .sort(
+      (a, b) =>
+        b.score - a.score ||
+        a.plan.atomicCount - b.plan.atomicCount ||
+        a.plan.matchType - b.plan.matchType,
+    );
+
   const uniq = [];
   const seen = new Set();
-  for (const p of plans) {
-    const k = `${p.matchType}:${p.atomicCount}:${actionKey(p)}`;
+  for (const row of ranked) {
+    if (row.deadly) continue;
+    const clearKey = pickClearShelf
+      ? (row.plan.clearShelves || []).join(",") || "none"
+      : "any";
+    // 稀缺/选架：同一颜色消在不同架算不同组；非稀缺：每色保留一组即可。
+    const k = pickClearShelf
+      ? `${row.plan.matchType}@${clearKey}`
+      : `${row.plan.matchType}`;
     if (seen.has(k)) continue;
     seen.add(k);
-    uniq.push(p);
-    if (uniq.length >= 8) break;
+    row.plan._scored = {
+      score: row.score,
+      reason: row.reason,
+      parts: row.parts,
+      deadly: row.deadly,
+    };
+    uniq.push(row.plan);
+    if (uniq.length >= (scarce ? 12 : pickClearShelf ? 8 : 6)) break;
+  }
+  if (!uniq.length) {
+    for (const row of ranked) {
+      const clearKey = pickClearShelf
+        ? (row.plan.clearShelves || []).join(",") || "none"
+        : "any";
+      const k = pickClearShelf
+        ? `${row.plan.matchType}@${clearKey}`
+        : `${row.plan.matchType}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      row.plan._scored = {
+        score: row.score,
+        reason: row.reason,
+        parts: row.parts,
+        deadly: row.deadly,
+      };
+      uniq.push(row.plan);
+      if (uniq.length >= 3) break;
+    }
   }
   return uniq;
 }
 
-function scorePlan(plan) {
-  if (plan.planKind === "dig") return scoreDigPlan(plan);
-  const score = 840 - plan.atomicCount * 50;
+function countPlaceableEmpties(shelves) {
+  let n = 0;
+  for (let i = 0; i < shelves.length; i += 1) {
+    if (!canPlaceOnShelf(shelves, i)) continue;
+    const layer = frontLayer(shelves[i]);
+    if (!layer) {
+      n += 3;
+      continue;
+    }
+    n += layer.filter((id) => id === 0).length;
+  }
+  return n;
+}
+
+function countFrontId(shelves, id, excludeShelf = -1) {
+  let n = 0;
+  for (let i = 0; i < shelves.length; i += 1) {
+    if (i === excludeShelf) continue;
+    const layer = frontLayer(shelves[i]);
+    if (!layer) continue;
+    for (const cell of layer) {
+      if (cell === id) n += 1;
+    }
+  }
+  return n;
+}
+
+function countNextLayerId(shelves, id) {
+  let n = 0;
+  for (const shelf of shelves) {
+    const peek = shelf.layers[1];
+    if (!peek) continue;
+    for (const cell of peek) {
+      if (cell === id) n += 1;
+    }
+  }
+  return n;
+}
+
+/** Pair with front + (≥3 across 全场首层 + 全场下一层). */
+const REVEAL_PAIR3_BONUS = 120;
+
+/**
+ * How useful is the layer exposed by a clear/dig for the *next* elimination.
+ * Empties, immediate dig-match, and pair-with-front when that id totals ≥3
+ * across all fronts + this revealed layer.
+ */
+function scoreRevealQuality(before, after, reveals) {
+  if (!reveals?.length) return { bonus: 0, parts: [], matchIds: [] };
+  const matchIds = digMatchIdsWithPrior(before, after, reveals);
+  let bonus = 0;
+  const parts = [];
+
+  if (matchIds.length) {
+    const add = 220 + (matchIds.length - 1) * 40;
+    bonus += add;
+    parts.push(`顺带翻层可消(id${matchIds.join(",")})+${add}`);
+  }
+
+  let pair3Applied = false;
+  for (const rev of reveals) {
+    const shelf = rev.shelf;
+    const layer = rev.layer || [];
+    const empties = layer.filter((id) => id === 0).length;
+    if (empties > 0) {
+      bonus += empties * 28;
+      parts.push(`选架#${shelf}下层+${empties * 28}`);
+    }
+
+    if (pair3Applied) continue;
+    const revealedCounts = new Map();
+    for (const id of layer) {
+      if (!id || isSpecialClearId(id)) continue;
+      revealedCounts.set(id, (revealedCounts.get(id) || 0) + 1);
+    }
+    for (const [id] of revealedCounts) {
+      if (matchIds.includes(id)) continue;
+      // 凑对：其它架首层已有；≥3：全场首层(除本架旧首层) + 全场下一层
+      const priorFront = countFrontId(before, id, shelf);
+      const total = priorFront + countNextLayerId(before, id);
+      if (priorFront >= 1 && total >= 3) {
+        bonus += REVEAL_PAIR3_BONUS;
+        parts.push(`凑对且两层≥3(id${id})+${REVEAL_PAIR3_BONUS}`);
+        pair3Applied = true; // 同一步只计一次
+        break;
+      }
+    }
+  }
+
+  return { bonus, parts, matchIds };
+}
+
+function evaluatePlanOutcome(before, plan) {
+  const after = cloneShelves(before);
+  if (!applyPlan(after, plan)) return null;
+  const reveals = detectReveals(before, after);
+  const quality = scoreRevealQuality(before, after, reveals);
   return {
-    score,
-    reason: "setup3",
-    parts: [`首层多步凑三(id${plan.matchType})×${plan.atomicCount}手+${score}`],
+    after,
+    reveals,
+    matchIds: quality.matchIds,
+    revealBonus: quality.bonus,
+    revealParts: quality.parts,
+    empties: countPlaceableEmpties(after),
+    actionsLeft: listActions(after).length,
   };
+}
+
+function scorePlan(plan, shelves = null, enabledOps = null) {
+  if (plan?._scored) {
+    return {
+      score: plan._scored.score,
+      reason: plan._scored.reason,
+      parts: plan._scored.parts,
+      deadly: plan._scored.deadly,
+    };
+  }
+  if (plan.planKind === "dig") return scoreDigPlan(plan, shelves, enabledOps);
+  // 凑三：非稀缺保持同分；稀缺时才按下层/留空区别打分（不依赖「选架翻层」开关）。
+  const scarce = Boolean(shelves && isRevealScarce(shelves));
+  const base = 800;
+  let score = base;
+  const parts = [`首层多步凑三(id${plan.matchType})×${plan.atomicCount}手+${base}`];
+  let deadly = false;
+
+  if (shelves) {
+    const ev = evaluatePlanOutcome(shelves, plan);
+    if (!ev) {
+      return { score: -1e9, reason: "setup3", parts: ["计划不可用"], deadly: true };
+    }
+    if (scarce) {
+      if (ev.revealBonus > 0) {
+        score += ev.revealBonus;
+        parts.push(...ev.revealParts);
+        const adj = applyScarceRevealAdjust(shelves, score, parts, ev);
+        score = adj.score;
+        parts.length = 0;
+        parts.push(...adj.parts);
+      } else if (ev.reveals?.length) {
+        score += 40;
+        parts.push("顺带翻层+40");
+      }
+      if (!isWon(ev.after) && ev.empties === 0) {
+        score -= 600;
+        parts.push("消后无空格-600");
+      } else if (ev.empties > 0) {
+        score += Math.min(60, ev.empties * 8);
+        parts.push(`留空位+${Math.min(60, ev.empties * 8)}`);
+      }
+    }
+    if (isWon(ev.after)) {
+      score += 500;
+      parts.push("通关+500");
+    } else if (ev.actionsLeft === 0) {
+      score -= 5000;
+      parts.push("消后无着-5000");
+      deadly = true;
+    }
+  }
+
+  return { score, reason: "setup3", parts, deadly };
 }
 
 /** Detect shelves whose front layer was cleared, exposing the next layer. */
@@ -170,14 +639,26 @@ function detectReveals(before, after) {
     const a = after[i];
     if (!b || !a) continue;
     if (b.layers.length <= a.layers.length) continue;
+    const removed = b.layers.length - a.layers.length;
+    const chainedMatchIds = [];
+    // layers[1].. that were also wiped in the same resolve (chain clears)
+    for (let li = 1; li < removed; li += 1) {
+      const layer = b.layers[li];
+      if (layer && isLayerMatched(layer) && !isSpecialClearId(layer[0])) {
+        chainedMatchIds.push(layer[0]);
+      }
+    }
     const layer = frontLayer(a);
     const revealedIds = layer
       ? layer.filter((id) => id && !isSpecialClearId(id))
       : [];
+    const peek = b.layers[1];
+    const peekIds = peek ? peek.filter((id) => id && !isSpecialClearId(id)) : [];
     out.push({
       shelf: i,
-      layer: layer ? [...layer] : [],
-      revealedIds,
+      layer: layer ? [...layer] : peek && removed >= 1 ? [...peek] : [],
+      revealedIds: revealedIds.length ? revealedIds : peekIds,
+      chainedMatchIds,
     });
   }
   return out;
@@ -187,8 +668,8 @@ function detectReveals(before, after) {
  * After a dig reveal, which types can actually be eliminated (true 翻层可消):
  * - revealed layer itself is a triple, or
  * - revealed ids + prior front counts reach ≥3, or
- * - after state already has ≥3 of a revealed type on the front.
- * Empty means reveal-only (多步翻层), not 翻层可消.
+ * - after state already has ≥3 of a revealed type on the front,
+ * - or a chained clear wiped a matched lower layer in the same resolve.
  */
 function digMatchIdsWithPrior(before, after, reveals) {
   const beforeFront = countFrontTypes(before);
@@ -196,6 +677,7 @@ function digMatchIdsWithPrior(before, after, reveals) {
   const matchIds = new Set();
 
   for (const rev of reveals) {
+    for (const id of rev.chainedMatchIds || []) matchIds.add(id);
     if (isLayerMatched(rev.layer) && !isSpecialClearId(rev.layer[0])) {
       matchIds.add(rev.layer[0]);
     }
@@ -244,96 +726,174 @@ function scoreDigStep(state, action) {
 }
 
 /**
- * Multi-step dig plans: keep moving from non-last-layer shelves until a lower
- * layer is exposed. Prefer reveals that can match with prior front items.
+ * Multi-step dig plans: clear a non-last-layer shelf until the next layer shows.
+ * Search per diggable shelf so true 翻层可消 is not crowded out by variants of
+ * the first reveal-only dig.
  */
 function findDigRevealPlans(shelves, maxLen = 4) {
   if (!shelves.some((s) => hasContentBehind(s))) return [];
 
   const plans = [];
-  const branchAt = [10, 8, 6, 5];
 
-  function dfs(state, path) {
-    if (plans.length >= 8) return;
-    if (path.length >= maxLen) return;
-    const depth = path.length;
-    const ranked = digRelevantActions(state)
-      .map((a) => ({ a, s: scoreDigStep(state, a) }))
-      .sort((x, y) => y.s - x.s)
-      .slice(0, branchAt[depth] ?? 5);
+  function actionsClearingShelf(state, shelfIndex) {
+    return listActions(state).filter((a) => {
+      if (a.type === "special") {
+        return a.shelf === shelfIndex && hasContentBehind(state[a.shelf]);
+      }
+      if (a.type === "move") {
+        return a.fromShelf === shelfIndex && hasContentBehind(state[a.fromShelf]);
+      }
+      return false;
+    });
+  }
 
-    for (const { a } of ranked) {
-      if (plans.length >= 8) break;
-      const next = cloneShelves(state);
-      if (!applyAction(next, a)) continue;
-      const newPath = path.concat([a]);
-      const reveals = detectReveals(shelves, next);
-      if (reveals.length) {
-        if (newPath.length >= 2) {
+  function searchClearShelf(targetShelf) {
+    const found = [];
+    const branchAt = [8, 6, 5, 4];
+
+    function dfs(state, path) {
+      if (found.length >= 1) return;
+      if (path.length >= maxLen) return;
+      const depth = path.length;
+      const ranked = actionsClearingShelf(state, targetShelf)
+        .map((a) => ({ a, s: scoreDigStep(state, a) }))
+        .sort((x, y) => y.s - x.s)
+        .slice(0, branchAt[depth] ?? 4);
+
+      for (const { a } of ranked) {
+        if (found.length >= 1) break;
+        const next = cloneShelves(state);
+        if (!applyAction(next, a)) continue;
+        const newPath = path.concat([a]);
+        const reveals = detectReveals(shelves, next).filter((r) => r.shelf === targetShelf);
+        if (reveals.length) {
           const matchIds = digMatchIdsWithPrior(shelves, next, reveals);
-          const canMatchPrior = matchIds.length > 0;
-          plans.push({
+          found.push({
             type: "plan",
             planKind: "dig",
             moves: newPath.map((m) => ({ ...m })),
             atomicCount: newPath.length,
             reveals,
-            canMatchPrior,
+            canMatchPrior: matchIds.length > 0,
             matchIds,
-            revealShelf: reveals[0].shelf,
+            revealShelf: targetShelf,
             revealTypes: [...new Set(reveals.flatMap((r) => r.revealedIds))],
           });
+          continue;
         }
-        continue;
+        if (newPath.length < maxLen) dfs(next, newPath);
       }
-      if (newPath.length < maxLen) dfs(next, newPath);
     }
+
+    dfs(shelves, []);
+    return found;
   }
 
-  dfs(shelves, []);
+  for (let si = 0; si < shelves.length; si += 1) {
+    if (!hasContentBehind(shelves[si])) continue;
+    plans.push(...searchClearShelf(si));
+  }
+
   plans.sort(
     (a, b) =>
       Number(b.canMatchPrior) - Number(a.canMatchPrior) ||
       a.atomicCount - b.atomicCount ||
       a.revealShelf - b.revealShelf,
   );
+
+  // One best plan per shelf (prefer already-sorted match + short path).
   const uniq = [];
-  const seen = new Set();
+  const seenShelf = new Set();
   for (const p of plans) {
-    const k = `${p.canMatchPrior}:${p.atomicCount}:${actionKey(p)}`;
-    if (seen.has(k)) continue;
-    seen.add(k);
+    const k = `${p.canMatchPrior ? "m" : "r"}:${p.revealShelf}`;
+    if (seenShelf.has(k)) continue;
+    seenShelf.add(k);
     uniq.push(p);
-    if (uniq.length >= 8) break;
   }
-  return uniq;
+
+  // Match digs first; keep reveal digs for every diggable shelf (sorted by peek empties).
+  const matches = uniq.filter((p) => p.canMatchPrior);
+  const reveals = uniq
+    .filter((p) => !p.canMatchPrior)
+    .sort((a, b) => {
+      const ea = peekEmptyCount(shelves[a.revealShelf]);
+      const eb = peekEmptyCount(shelves[b.revealShelf]);
+      return eb - ea || a.atomicCount - b.atomicCount || a.revealShelf - b.revealShelf;
+    });
+  const diggable = shelves.filter((s) => hasContentBehind(s)).length;
+  const revealCap = Math.max(diggable, 6);
+  return matches.concat(reveals.slice(0, revealCap)).slice(0, 16);
 }
 
-function scoreDigPlan(plan) {
+function scoreDigPlan(plan, shelves = null, enabledOps = null) {
   const revealText = (plan.revealTypes || []).join(",") || "?";
   const matchText = (plan.matchIds || []).join(",") || revealText;
-  if (plan.canMatchPrior && plan.matchIds?.length) {
-    const score = 760 - plan.atomicCount * 45;
-    return {
-      score,
-      reason: "digMatch",
-      parts: [`翻层可消(id${matchText})×${plan.atomicCount}手+${score}`],
-    };
+  const isMatch = plan.canMatchPrior && plan.matchIds?.length;
+  const scarceHands = Boolean(shelves && isRevealScarce(shelves));
+  const base = isMatch
+    ? scarceHands
+      ? 760
+      : 760 - plan.atomicCount * 45
+    : scarceHands
+      ? 400
+      : 400 - plan.atomicCount * 40;
+  let score = base;
+  const reason = isMatch ? "digMatch" : "digReveal";
+  const parts = [
+    isMatch
+      ? `翻层可消(id${matchText})×${plan.atomicCount}手+${base}`
+      : `多步翻层(露出id${revealText})×${plan.atomicCount}手+${base}`,
+  ];
+  if (scarceHands && plan.atomicCount > 1) {
+    parts.push("稀缺不计手数");
   }
-  const score = 400 - plan.atomicCount * 40;
-  return {
-    score,
-    reason: "digReveal",
-    parts: [`多步翻层(露出id${revealText})×${plan.atomicCount}手+${score}`],
-  };
+
+  let deadly = false;
+  if (shelves) {
+    const ev = evaluatePlanOutcome(shelves, plan);
+    if (!ev) {
+      return { score: -1e9, reason, parts: ["翻层计划不可用"], deadly: true };
+    }
+    const useRevealPick = wantsSetupReveal(enabledOps);
+    const scarce = useRevealPick && isRevealScarce(shelves);
+    if (useRevealPick && ev.revealBonus > 0) {
+      score += ev.revealBonus;
+      parts.push(...ev.revealParts);
+      if (scarce) {
+        const adj = applyScarceRevealAdjust(shelves, score, parts, ev);
+        score = adj.score;
+        parts.length = 0;
+        parts.push(...adj.parts);
+      }
+    }
+    if (isWon(ev.after)) {
+      score += 500;
+      parts.push("通关+500");
+    } else if (ev.actionsLeft === 0) {
+      score -= 5000;
+      parts.push("翻后无着-5000");
+      deadly = true;
+    } else if (ev.empties === 0) {
+      score -= 5000;
+      parts.push("翻后无空位-5000");
+      deadly = true;
+    } else if (ev.empties > 0) {
+      score += Math.min(60, ev.empties * 8);
+      parts.push(`翻后留空+${Math.min(60, ev.empties * 8)}`);
+    }
+  }
+
+  return { score, reason, parts, deadly };
 }
 
-function scoreActionDetailed(shelves, action) {
-  if (action.type === "plan") return scorePlan(action);
+function scoreActionDetailed(shelves, action, enabledOps = null) {
+  if (action.type === "plan") return scorePlan(action, shelves, enabledOps);
   if (action.type === "special") {
     return { score: 1000, reason: "special", parts: ["点999"] };
   }
 
+  const useRevealPick = wantsSetupReveal(enabledOps);
+  const scarce = Boolean(shelves && isRevealScarce(shelves));
   const target = shelves[action.toShelf];
   let layer = frontLayer(target);
   const width = layer?.length ?? 3;
@@ -343,51 +903,131 @@ function scoreActionDetailed(shelves, action) {
   let score = 0;
   const parts = [];
 
-  if (
+  const isMatch3 =
     willCreate.length === 3 &&
     willCreate.every((id) => id !== 0 && id === willCreate[0]) &&
-    !isSpecialClearId(willCreate[0])
-  ) {
+    !isSpecialClearId(willCreate[0]);
+  if (isMatch3) {
     score += 800;
     parts.push("凑三+800");
   }
 
   const sameOnTarget = willCreate.filter((id) => id === action.id).length;
-
   const src = shelves[action.fromShelf];
-  if (hasContentBehind(src)) {
+  const srcBehind = hasContentBehind(src);
+  const destBehind = hasContentBehind(target);
+  // Full simulate only when a reveal or post-clear deadlock check is plausible.
+  const needApply = srcBehind || (isMatch3 && destBehind) || isMatch3;
+
+  if (needApply) {
     const snap = cloneShelves(shelves);
-    if (applyAction(snap, action)) {
+    const applied = applyAction(snap, action);
+    if (applied) {
       const reveals = detectReveals(shelves, snap);
       if (reveals.length) {
-        const matchIds = digMatchIdsWithPrior(shelves, snap, reveals);
-        const revealedIds = [...new Set(reveals.flatMap((r) => r.revealedIds))];
-        if (matchIds.length) {
-          score += 220;
-          parts.push(`翻层可消(id${matchIds.join(",")})+220`);
+        // 凑三：非稀缺不叠翻层分（保持组间同分）；稀缺时才按下层质量区别打分。
+        if (isMatch3) {
+          if (scarce) {
+            const quality = scoreRevealQuality(shelves, snap, reveals);
+            if (quality.bonus > 0) {
+              score += quality.bonus;
+              parts.push(...quality.parts);
+              const adj = applyScarceRevealAdjust(shelves, score, parts, {
+                reveals,
+                revealBonus: quality.bonus,
+              });
+              score = adj.score;
+              parts.length = 0;
+              parts.push(...adj.parts);
+            } else {
+              score += 40;
+              parts.push("顺带翻层+40");
+            }
+            if (!isWon(snap)) {
+              const emptiesAfterReveal = countPlaceableEmpties(snap);
+              if (emptiesAfterReveal === 0) {
+                score -= 600;
+                parts.push("消后无空格-600");
+              } else if (emptiesAfterReveal > 0) {
+                score += Math.min(60, emptiesAfterReveal * 8);
+                parts.push(`留空位+${Math.min(60, emptiesAfterReveal * 8)}`);
+              }
+            }
+          }
+        } else if (useRevealPick) {
+          const quality = scoreRevealQuality(shelves, snap, reveals);
+          if (quality.bonus > 0) {
+            score += quality.bonus;
+            parts.push(...quality.parts);
+            if (scarce) {
+              const adj = applyScarceRevealAdjust(shelves, score, parts, {
+                reveals,
+                revealBonus: quality.bonus,
+              });
+              score = adj.score;
+              parts.length = 0;
+              parts.push(...adj.parts);
+            }
+          } else {
+            score += 40;
+            parts.push("顺带翻层+40");
+          }
         } else {
-          score += 90;
-          parts.push(`多步翻层(露出id${revealedIds.join(",") || "?"})+90`);
+          const matchIds = digMatchIdsWithPrior(shelves, snap, reveals);
+          const revealedIds = [...new Set(reveals.flatMap((r) => r.revealedIds))];
+          if (matchIds.length && enabledOps?.digMatch !== false) {
+            score += 220;
+            parts.push(`翻层可消(id${matchIds.join(",")})+220`);
+          } else if (!matchIds.length && enabledOps?.digReveal !== false) {
+            score += 90;
+            parts.push(`多步翻层(露出id${revealedIds.join(",") || "?"})+90`);
+          } else if (srcBehind) {
+            score += 30;
+            parts.push("非末层+30");
+          }
         }
-      } else {
+        if (!isWon(snap) && !isMatch3) {
+          const emptiesAfterReveal = countPlaceableEmpties(snap);
+          if (listActions(snap).length === 0) {
+            score -= 5000;
+            parts.push("翻后无着-5000");
+          } else if (emptiesAfterReveal === 0) {
+            score -= 5000;
+            parts.push("翻后无空位-5000");
+          }
+        }
+      } else if (srcBehind && !isMatch3) {
         score += 30;
         parts.push("非末层+30");
       }
-    } else {
+      if (isMatch3) {
+        if (isWon(snap)) {
+          score += 500;
+          parts.push("通关+500");
+        } else if (listActions(snap).length === 0) {
+          score -= 5000;
+          parts.push("消后无着-5000");
+        }
+      }
+    } else if (srcBehind && !isMatch3) {
       score += 30;
       parts.push("非末层+30");
     }
+  } else if (srcBehind && !isMatch3) {
+    score += 30;
+    parts.push("非末层+30");
   }
-  if (src.width === 1) {
+
+  if (src.width === 1 && !isMatch3) {
     score += 20;
     parts.push("单格源+20");
   }
-  if (sameOnTarget === 2) {
+  if (!isMatch3 && sameOnTarget === 2) {
     score += 80;
     parts.push("凑对+80");
   }
   const emptiesAfter = willCreate.filter((id) => id === 0).length;
-  if (emptiesAfter > 0) {
+  if (!isMatch3 && emptiesAfter > 0) {
     score += emptiesAfter * 3;
     parts.push(`留空+${emptiesAfter * 3}`);
   }
@@ -395,10 +1035,13 @@ function scoreActionDetailed(shelves, action) {
   let reason = "move";
   if (parts.some((p) => p.startsWith("凑三"))) reason = "match3";
   else if (parts.some((p) => p.startsWith("凑对"))) reason = "pair";
-  else if (parts.some((p) => p.startsWith("翻层可消"))) reason = "digMatch";
-  else if (parts.some((p) => p.startsWith("多步翻层"))) reason = "digReveal";
+  else if (parts.some((p) => p.startsWith("翻层可消") || p.startsWith("顺带翻层可消"))) reason = "digMatch";
+  else if (parts.some((p) => p.startsWith("多步翻层") || p.startsWith("顺带翻层"))) reason = "digReveal";
+  else if (parts.some((p) => p.startsWith("选架#"))) reason = "setupReveal";
   else if (parts.some((p) => p.startsWith("非末层"))) reason = "dig";
   else if (parts.some((p) => p.startsWith("单格"))) reason = "single";
+
+  if (parts.some((p) => p.startsWith("凑三"))) reason = "match3";
 
   return { score, reason, parts };
 }
@@ -415,7 +1058,9 @@ function describeAction(action) {
       const revealed = (action.revealTypes || []).join(",") || "?";
       return `多步翻层(露出id${revealed})×${action.atomicCount}手：${hands}`;
     }
-    return `首层多步凑三(id${action.matchType})×${action.atomicCount}手：${hands}`;
+    return `首层多步凑三(id${action.matchType}${
+      action.clearShelves?.length ? `@架${action.clearShelves.join(",")}` : ""
+    })×${action.atomicCount}手：${hands}`;
   }
   return `搬 id${action.id}：架${action.fromShelf}格${action.fromSlot} → 架${action.toShelf}格${action.toSlot}`;
 }
@@ -460,39 +1105,131 @@ function applyPlan(shelves, plan) {
   return true;
 }
 
-function rankGreedyActions(shelves, actions, random, topK = 5) {
+function rankGreedyActions(shelves, actions, random, topK = 5, enabledOps = defaultEnabledOps()) {
   const specials = actions.filter((a) => a.type === "special");
-  if (specials.length) {
+  if (specials.length && isOpEnabled(enabledOps, "special")) {
     const chosen = pickRandom(specials, random);
     return {
       chosen,
       ranked: specials.slice(0, topK).map((action) => ({
         action,
-        ...scoreActionDetailed(shelves, action),
+        ...scoreActionDetailed(shelves, action, enabledOps),
       })),
     };
   }
 
-  const scoredAtom = actions.map((action) => ({
-    action,
-    ...scoreActionDetailed(shelves, action),
-  }));
-  // Prefer clearing front triples before starting another dig.
-  const frontMatchPlans = findFrontMatchPlans(shelves, 4);
-  const digPlans =
-    frontMatchPlans.length || frontTripleTypes(shelves).size
-      ? []
-      : findDigRevealPlans(shelves, 4);
-  const scoredPlans = frontMatchPlans.concat(digPlans).map((plan) => ({
-    action: plan,
-    ...scorePlan(plan),
-  }));
-  const scored = scoredPlans.concat(scoredAtom);
-  scored.sort((a, b) => b.score - a.score);
+  const scarce = isRevealScarce(shelves);
+
+  // Prefer clearing front triples before starting another dig — unless every
+  // setup3 / match3 candidate leaves the board with no legal moves (space lock).
+  const frontMatchPlans = isOpEnabled(enabledOps, "setup3")
+    ? findFrontMatchPlans(shelves, scarce ? 6 : 4, enabledOps, random)
+    : [];
+  const scoredSetup = frontMatchPlans
+    .map((plan) => ({
+      action: plan,
+      ...scorePlan(plan, shelves, enabledOps),
+    }))
+    .filter((s) => isOpEnabled(enabledOps, s.reason));
+  const hasViableSetup = scoredSetup.some((s) => !s.deadly);
+  const bestSetup = scoredSetup.reduce((m, s) => Math.max(m, s.score), -Infinity);
+
+  // Score atomics; if a strong viable setup exists, only fully score a shortlist.
+  let atomPool = actions.filter((a) => a.type !== "special");
+  if (hasViableSetup && bestSetup >= 600 && atomPool.length > 36 && !scarce) {
+    atomPool = atomPool.slice(0, 36);
+  }
+  const scoredAtom = atomPool
+    .map((action) => ({
+      action,
+      ...scoreActionDetailed(shelves, action, enabledOps),
+    }))
+    .filter((s) => isOpEnabled(enabledOps, s.reason));
+  const hasViableMatch3 = scoredAtom.some(
+    (s) =>
+      s.reason === "match3" &&
+      !s.parts.some((p) => p.startsWith("消后无着") || p.startsWith("翻后无着")),
+  );
+
+  let digPlans = [];
+  const wantDigLayer = enabledOps.digLayer !== false;
+  const wantDigMatch = enabledOps.digMatch !== false;
+  const wantDigReveal = enabledOps.digReveal !== false;
+  // 场上已有可走的首层凑三时先消，不拿翻层（含翻层可消）来比分。
+  if (
+    (wantDigMatch || wantDigReveal || wantDigLayer) &&
+    !hasViableSetup &&
+    !hasViableMatch3
+  ) {
+    digPlans = findDigRevealPlans(shelves, 4).filter((p) => {
+      if (wantDigLayer) return true;
+      const isMatch = p.canMatchPrior && p.matchIds?.length;
+      return isMatch ? wantDigMatch : wantDigReveal;
+    });
+  }
+
+  const scoredDig = digPlans
+    .map((plan) => ({
+      action: plan,
+      ...scorePlan(plan, shelves, enabledOps),
+    }))
+    .filter((s) => isOpEnabled(enabledOps, s.reason));
+
+  const viableSetup = scoredSetup.filter((s) => !s.deadly);
+  const viableMatch3 = scoredAtom.filter(
+    (s) =>
+      s.reason === "match3" &&
+      !s.parts.some((p) => p.startsWith("消后无着") || p.startsWith("翻后无着")),
+  );
+
+  let scored;
+  if (viableSetup.length || viableMatch3.length) {
+    // 直接消首层三连：优先只消一架的短凑三，避免被「顺带多翻层」高分带跑。
+    const singleClear = viableSetup.filter(
+      (s) => (s.action.clearShelves || []).length <= 1,
+    );
+    const setupPool = singleClear.length ? singleClear : viableSetup;
+    scored = setupPool.concat(viableMatch3);
+    scored.sort((a, b) => b.score - a.score);
+  } else {
+    const scoredAll = scoredSetup.concat(scoredDig).concat(scoredAtom);
+    const scoredLive = scoredAll.filter((s) => !s.deadly);
+    scored = scoredLive.length ? scoredLive : scoredAll;
+    scored.sort((a, b) => b.score - a.score);
+  }
+
+  // If filters wiped the pool, fall back to any remaining atomic moves that are still allowed.
+  if (!scored.length) {
+    scored = actions
+      .filter((a) => a.type !== "special" || isOpEnabled(enabledOps, "special"))
+      .map((action) => ({
+        action,
+        ...scoreActionDetailed(shelves, action, enabledOps),
+      }))
+      .filter((s) => isOpEnabled(enabledOps, s.reason));
+    scored.sort((a, b) => b.score - a.score);
+  }
+
+  if (!scored.length) {
+    return { chosen: null, ranked: [] };
+  }
 
   const best = scored[0]?.score ?? -Infinity;
-  const pool = scored.filter((s) => s.score === best);
-  const chosen = pickRandom(pool.map((s) => s.action), random);
+  let pool = scored.filter((s) => s.score === best);
+  // Prefer random among 凑三组 when they tie at the top (match3 / setup3).
+  const matchPool = pool.filter((s) => s.reason === "match3" || s.reason === "setup3");
+  let pickFrom = matchPool.length ? matchPool : pool;
+  // 同分优先更少手数（直接消，不绕路）。
+  const minHands = Math.min(
+    ...pickFrom.map((s) => s.action.atomicCount || (s.action.type === "plan" ? 99 : 1)),
+  );
+  pickFrom = pickFrom.filter(
+    (s) => (s.action.atomicCount || (s.action.type === "plan" ? 99 : 1)) === minHands,
+  );
+  const chosen = pickRandom(
+    pickFrom.map((s) => s.action),
+    random,
+  );
 
   return { chosen, ranked: scored.slice(0, topK) };
 }
@@ -503,6 +1240,7 @@ export function playout(rawLevel, options = {}) {
   const seed = options.seed ?? 1;
   const wantTrace = Boolean(options.trace);
   const topK = options.topK ?? 5;
+  const enabledOps = normalizeEnabledOps(options.enabledOps);
 
   const state = createState(rawLevel);
   const shelves = state.shelves;
@@ -512,10 +1250,22 @@ export function playout(rawLevel, options = {}) {
   let moves = 0;
   let logicSteps = 0;
   let loops = 0;
+  let stallSteps = 0;
+  let bestProgress = 0;
+  let pathHash = 2166136261 >>> 0;
   const trace = wantTrace ? [] : null;
+
+  const mixPath = (action) => {
+    const key = actionKey(action);
+    for (let i = 0; i < key.length; i += 1) {
+      pathHash = Math.imul(pathHash ^ key.charCodeAt(i), 16777619) >>> 0;
+    }
+    pathHash = Math.imul(pathHash ^ (logicSteps + 1), 16777619) >>> 0;
+  };
 
   const finish = (result) => {
     const left = result === "win" ? 0 : countItems(shelves);
+    const progress = result === "win" ? 1 : itemsStart ? (itemsStart - left) / itemsStart : 0;
     const out = {
       result,
       moves,
@@ -523,18 +1273,29 @@ export function playout(rawLevel, options = {}) {
       itemsStart,
       itemsLeft: left,
       layersLeft: result === "win" ? 0 : countLayers(shelves),
-      progress: result === "win" ? 1 : itemsStart ? (itemsStart - left) / itemsStart : 0,
+      progress,
       loops,
       seed,
+      pathKey: `${result}|${moves}|${logicSteps}|${pathHash >>> 0}`,
     };
     if (trace) out.trace = trace;
     return out;
   };
 
-  const pushTrace = ({ used, detail, beforeBoard, candidates, skipped, wasPreferred, ranked }) => {
+  const pushTrace = ({
+    used,
+    detail,
+    beforeBoard,
+    candidates,
+    skipped,
+    wasPreferred,
+    ranked,
+    revealBefore,
+  }) => {
     if (!trace || !detail) return;
     const left = countItems(shelves);
     const atomicCount = used?.type === "plan" ? used.atomicCount || used.moves?.length || 1 : 1;
+    const revealAfter = estimateRevealChances(shelves);
     trace.push({
       step: logicSteps,
       atomicCount,
@@ -566,6 +1327,12 @@ export function playout(rawLevel, options = {}) {
       before: beforeBoard,
       after: snapshotBoard(shelves),
       highlight: highlightForAction(used),
+      revealChancesBefore: revealBefore?.chances ?? null,
+      revealChances: revealAfter.chances,
+      revealEmpties: revealAfter.empties,
+      revealDigChances: revealAfter.digChances,
+      revealMatchGroups: revealAfter.matchGroups,
+      revealScarce: revealAfter.diggable > 0 && revealAfter.chances <= 2,
     });
   };
 
@@ -574,6 +1341,17 @@ export function playout(rawLevel, options = {}) {
     const actions = listActions(shelves);
     if (isBoardFailed(shelves) || actions.length === 0) return finish("deadlock");
     if (moves >= maxMoves) return finish("limit");
+    if (loops >= 80) return finish("deadlock");
+    const progressNow = itemsStart ? (itemsStart - countItems(shelves)) / itemsStart : 0;
+    if (progressNow > bestProgress + 1e-9) {
+      bestProgress = progressNow;
+      stallSteps = 0;
+    } else {
+      stallSteps += 1;
+      if (stallSteps >= 250) return finish("deadlock");
+    }
+
+    const revealBefore = wantTrace ? estimateRevealChances(shelves) : null;
 
     let chosen = null;
     let ranked = [];
@@ -613,6 +1391,7 @@ export function playout(rawLevel, options = {}) {
         shelves.length = 0;
         shelves.push(...snapshot);
         seen.add(h);
+        mixPath(action);
         moves += 1;
         logicSteps += 1;
         applied = true;
@@ -624,6 +1403,7 @@ export function playout(rawLevel, options = {}) {
           skipped,
           wasPreferred: action === chosen,
           ranked,
+          revealBefore,
         });
         break;
       }
@@ -631,7 +1411,7 @@ export function playout(rawLevel, options = {}) {
       continue;
     }
 
-    const ranking = rankGreedyActions(shelves, actions, random, topK);
+    const ranking = rankGreedyActions(shelves, actions, random, topK, enabledOps);
     chosen = ranking.chosen;
     ranked = ranking.ranked;
 
@@ -658,7 +1438,7 @@ export function playout(rawLevel, options = {}) {
         const fromRanked = ranked.find((r) => actionKey(r.action) === actionKey(action));
         detail = fromRanked
           ? { score: fromRanked.score, reason: fromRanked.reason, parts: [...fromRanked.parts] }
-          : scoreActionDetailed(shelves, action);
+          : scoreActionDetailed(shelves, action, enabledOps);
         if (!preferred) detail.parts = [...detail.parts, "避环次选"];
         if (skipped) detail.parts.push(`跳过环${skipped}`);
       }
@@ -666,6 +1446,7 @@ export function playout(rawLevel, options = {}) {
       shelves.length = 0;
       shelves.push(...snapshot);
       seen.add(h);
+      mixPath(action);
       moves += atomicCount;
       logicSteps += 1;
       pushTrace({
@@ -676,17 +1457,29 @@ export function playout(rawLevel, options = {}) {
         skipped,
         wasPreferred: preferred,
         ranked,
+        revealBefore,
       });
       return true;
     };
 
     if (tryCommit(chosen, true)) applied = true;
     else {
-      for (const action of actions) {
-        if (chosen && actionKey(action) === actionKey(chosen)) continue;
-        if (tryCommit(action, false)) {
+      for (const r of ranked) {
+        if (chosen && actionKey(r.action) === actionKey(chosen)) continue;
+        if (tryCommit(r.action, false)) {
           applied = true;
           break;
+        }
+      }
+      if (!applied) {
+        for (const action of actions) {
+          if (chosen && actionKey(action) === actionKey(chosen)) continue;
+          const detail = scoreActionDetailed(shelves, action, enabledOps);
+          if (!isOpEnabled(enabledOps, detail.reason)) continue;
+          if (tryCommit(action, false)) {
+            applied = true;
+            break;
+          }
         }
       }
     }
@@ -708,7 +1501,27 @@ function mean(arr) {
   return arr.reduce((a, b) => a + b, 0) / arr.length;
 }
 
+function assignPatternIds(results) {
+  const order = new Map();
+  const counts = new Map();
+  let next = 1;
+  for (const r of results) {
+    const key =
+      r.pathKey ||
+      `${r.result}|${r.moves}|${r.logicSteps}|${r.progress}|${r.loops}|${r.itemsLeft}`;
+    if (!order.has(key)) order.set(key, next++);
+    const id = order.get(key);
+    r.patternId = id;
+    counts.set(id, (counts.get(id) || 0) + 1);
+  }
+  for (const r of results) {
+    r.patternCount = counts.get(r.patternId) || 1;
+  }
+  return order.size;
+}
+
 function buildReport(results, profile, config) {
+  const patternTypes = assignPatternIds(results);
   const trials = results.length;
   const wins = results.filter((r) => r.result === "win");
   const deadlocks = results.filter((r) => r.result === "deadlock");
@@ -772,6 +1585,7 @@ function buildReport(results, profile, config) {
       earlyStuckRate: earlyStuck,
       difficulty: Math.round(difficulty * 10) / 10,
       tier,
+      patternTypes,
     },
     progressBuckets: buckets.map((b) => ({
       label: b.label,
@@ -797,10 +1611,11 @@ export async function analyzeLevelAsync(rawLevel, options = {}) {
   const seed0 = options.seed ?? 42;
   const chunkSize = Math.max(1, options.chunkSize ?? 8);
   const onProgress = options.onProgress;
+  const enabledOps = normalizeEnabledOps(options.enabledOps);
 
   const state0 = createState(rawLevel);
   const profile = staticProfile(state0.shelves);
-  const config = { trials, strategy, maxMoves, seed: seed0 };
+  const config = { trials, strategy, maxMoves, seed: seed0, enabledOps };
 
   const results = [];
   const startedAt = performance.now();
@@ -811,6 +1626,7 @@ export async function analyzeLevelAsync(rawLevel, options = {}) {
       strategy,
       maxMoves,
       seed,
+      enabledOps,
     });
     result.trialIndex = i;
     results.push(result);
@@ -841,13 +1657,14 @@ export async function analyzeLevelAsync(rawLevel, options = {}) {
 
 /**
  * @param {any} rawLevel
- * @param {{trials?:number, strategy?:string, maxMoves?:number, seed?:number}} options
+ * @param {{trials?:number, strategy?:string, maxMoves?:number, seed?:number, enabledOps?:object}} options
  */
 export function analyzeLevel(rawLevel, options = {}) {
   const trials = options.trials ?? 200;
   const strategy = options.strategy ?? "greedy";
   const maxMoves = options.maxMoves ?? 2500;
   const seed0 = options.seed ?? 42;
+  const enabledOps = normalizeEnabledOps(options.enabledOps);
 
   const state0 = createState(rawLevel);
   const profile = staticProfile(state0.shelves);
@@ -859,6 +1676,7 @@ export function analyzeLevel(rawLevel, options = {}) {
       strategy,
       maxMoves,
       seed,
+      enabledOps,
     });
     result.trialIndex = i;
     results.push(result);
@@ -869,6 +1687,7 @@ export function analyzeLevel(rawLevel, options = {}) {
     strategy,
     maxMoves,
     seed: seed0,
+    enabledOps,
   });
 }
 

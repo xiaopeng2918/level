@@ -4,82 +4,15 @@
  * Heavy simulation runs in a Web Worker so the page stays responsive.
  */
 
-import { analyzeLevelAsync } from "./analyze.js?v=20260730d";
+import { defaultEnabledOps, normalizeEnabledOps } from "./analyze.js?v=20260801k";
+import { analyzeLevelOffMain, terminateAnalyzeWorker } from "./analyze-client.js?v=20260801k";
 
-let analyzeWorker = null;
-let analyzeReqId = 0;
-/** @type {{ id: number, reject: (err: Error) => void, onMessage: (e: MessageEvent) => void } | null} */
-let pendingAnalyze = null;
-
-function terminateAnalyzeWorker() {
-  const pending = pendingAnalyze;
-  pendingAnalyze = null;
-  if (pending && analyzeWorker) {
-    analyzeWorker.removeEventListener("message", pending.onMessage);
-    try {
-      pending.reject(new Error("cancelled"));
-    } catch {
-      /* already settled */
-    }
-  }
-  if (analyzeWorker) {
-    analyzeWorker.terminate();
-    analyzeWorker = null;
-  }
-}
-
-function getAnalyzeWorker() {
-  if (analyzeWorker) return analyzeWorker;
-  analyzeWorker = new Worker(new URL("./analyze-worker.js", import.meta.url), {
-    type: "module",
+function readEnabledOpsFromUi() {
+  const ops = defaultEnabledOps();
+  document.querySelectorAll("#simOpsList input[data-sim-op]").forEach((input) => {
+    ops[input.dataset.simOp] = input.checked;
   });
-  analyzeWorker.onerror = () => {
-    terminateAnalyzeWorker();
-  };
-  return analyzeWorker;
-}
-
-/**
- * Run one level off the main thread. Falls back to async main-thread analyze.
- */
-function analyzeLevelOffMain(rawLevel, options = {}) {
-  try {
-    const worker = getAnalyzeWorker();
-    const id = (analyzeReqId += 1);
-    return new Promise((resolve, reject) => {
-      const onMessage = (event) => {
-        const msg = event.data || {};
-        if (msg.id !== id) return;
-        if (msg.type === "progress") {
-          options.onProgress?.(msg);
-          return;
-        }
-        if (pendingAnalyze?.id === id) pendingAnalyze = null;
-        worker.removeEventListener("message", onMessage);
-        if (msg.type === "result") resolve(msg.report);
-        else reject(new Error(msg.message || "Worker 分析失败"));
-      };
-      pendingAnalyze = { id, reject, onMessage };
-      worker.addEventListener("message", onMessage);
-      worker.postMessage({
-        type: "analyze",
-        id,
-        rawLevel,
-        options: {
-          trials: options.trials,
-          strategy: options.strategy,
-          maxMoves: options.maxMoves,
-          seed: options.seed,
-          chunkSize: options.chunkSize ?? 2,
-        },
-      });
-    });
-  } catch {
-    return analyzeLevelAsync(rawLevel, {
-      ...options,
-      chunkSize: options.chunkSize ?? 1,
-    });
-  }
+  return normalizeEnabledOps(ops);
 }
 
 const RESULT_FIELDS = [
@@ -560,9 +493,11 @@ async function runBatch() {
       const report = await analyzeLevelOffMain(row.level, {
         trials,
         strategy: "greedy",
-        maxMoves: 5000,
+        maxMoves: 2500,
         seed: 42,
         chunkSize: 2,
+        enabledOps: readEnabledOpsFromUi(),
+        slimResults: true,
         onProgress: (p) => {
           if (state.stop) return;
           const levelPct = p.total ? Math.round((p.done / p.total) * 100) : 0;
