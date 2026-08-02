@@ -1,9 +1,9 @@
 /**
- * Off-main-thread entry for Monte Carlo analysis (shared by UI + batch).
+ * Off-main-thread entry for Monte Carlo / fork analysis (shared by UI + batch).
  */
-import { analyzeLevelAsync } from "./analyze.js?v=20260801k";
+import { analyzeLevelAsync, analyzeForkAsync } from "./analyze.js?v=20260802k";
 
-const WORKER_VER = "20260801k";
+const WORKER_VER = "20260802k";
 
 let analyzeWorker = null;
 let analyzeReqId = 0;
@@ -44,12 +44,14 @@ function getAnalyzeWorker() {
 }
 
 /**
- * Run analyzeLevelAsync in a Worker when possible; fall back to main thread.
+ * Run analyzeLevelAsync / analyzeForkAsync in a Worker when possible; fall back to main thread.
  * @param {object} options
+ * @param {"montecarlo"|"fork"} [options.mode]
  * @param {boolean} [options.slimResults=false] Drop per-trial rows (batch only).
  */
 export function analyzeLevelOffMain(rawLevel, options = {}) {
   const shouldSlim = options.slimResults === true;
+  const mode = options.mode === "fork" ? "fork" : "montecarlo";
 
   try {
     const worker = getAnalyzeWorker();
@@ -74,7 +76,10 @@ export function analyzeLevelOffMain(rawLevel, options = {}) {
         id,
         rawLevel,
         options: {
+          mode,
           trials: options.trials,
+          maxBranches: options.maxBranches ?? options.trials,
+          maxForkWidth: options.maxForkWidth,
           strategy: options.strategy,
           maxMoves: options.maxMoves,
           seed: options.seed,
@@ -85,6 +90,13 @@ export function analyzeLevelOffMain(rawLevel, options = {}) {
       });
     });
   } catch {
+    if (mode === "fork") {
+      return analyzeForkAsync(rawLevel, {
+        ...options,
+        maxBranches: options.maxBranches ?? options.trials ?? 64,
+        chunkSize: options.chunkSize ?? 1,
+      });
+    }
     return analyzeLevelAsync(rawLevel, {
       ...options,
       chunkSize: options.chunkSize ?? 1,

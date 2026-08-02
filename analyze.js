@@ -57,19 +57,19 @@ export const SIM_OP_DEFS = [
     id: "digMatch",
     label: "翻层可消",
     scene: "清空非末层货架的首层后露出下层，且露出的物品能与首层已有同色凑成可消。",
-    score: "合成计划：非稀缺 760−手数×45；稀缺固定 760。可叠下层空位/凑对且两层≥3。通关 +500；无着/无空 −5000。单步碰巧翻开可消 +220。",
+    score: "合成计划：非稀缺 760−手数×45；稀缺固定 760。可叠下层空位/两层≥3。通关 +500；无着/无空 −5000。单步碰巧翻开可消 +220。",
   },
   {
     id: "digReveal",
     label: "多步翻层",
     scene: "清空非末层货架的首层并露出下层，但当前还不能立刻消除（纯翻层推进）。",
-    score: "合成计划：非稀缺 400−手数×40；稀缺固定 400。优先翻出能与全场首层凑对、且该色在全场首层+全场下一层合计≥3。通关 +500；无着/无空 −5000。",
+    score: "合成计划：非稀缺 400−手数×40；稀缺固定 400。翻出 id 在全场首层+全场下一层合计≥3 时加分（不必首层已有）。通关 +500；无着/无空 −5000。",
   },
   {
     id: "digLayer",
     label: "露出下层",
-    scene: "只要清空首层并成功露出下一层即可，不判断翻开后能不能立刻消除（可消与不可消都算）。",
-    score: "不单独计分；勾选后允许任意翻层计划，具体分值仍按「翻层可消」或「多步翻层」计算。",
+    scene: "翻层总开关之一：与「翻层可消 / 多步翻层」一起决定是否搜翻层计划。若后两者有勾选，以它们为准；仅勾本项时才允许任意翻层。",
+    score: "不单独计分。可消/不可消分别由「翻层可消」「多步翻层」勾选控制，不再被本项强行放行。",
   },
   {
     id: "dig",
@@ -95,6 +95,62 @@ export function defaultEnabledOps() {
   return Object.fromEntries(SIM_OP_DEFS.map((op) => [op.id, true]));
 }
 
+/** Preset op sets from the difficulty-tier table (简单→超困难). */
+export const SIM_OP_PRESETS = {
+  easy: {
+    label: "简单",
+    ops: {
+      special: true,
+      match3: true,
+      setup3: true,
+      move: true,
+      pair: true,
+      digMatch: false,
+      dig: true,
+      digReveal: true,
+      setupReveal: false,
+      single: true,
+      digLayer: true,
+    },
+  },
+  normal: {
+    label: "普通",
+    ops: {
+      special: true,
+      match3: true,
+      setup3: true,
+      move: true,
+      pair: true,
+      digMatch: true,
+      dig: true,
+      digReveal: true,
+      setupReveal: false,
+      single: true,
+      digLayer: true,
+    },
+  },
+  hard: {
+    label: "困难",
+    ops: {
+      special: true,
+      match3: true,
+      setup3: true,
+      move: true,
+      pair: true,
+      digMatch: true,
+      dig: true,
+      digReveal: true,
+      setupReveal: true,
+      single: true,
+      digLayer: true,
+    },
+  },
+  ultra: {
+    label: "超困难",
+    ops: Object.fromEntries(SIM_OP_DEFS.map((op) => [op.id, true])),
+  },
+};
+
 export function normalizeEnabledOps(input) {
   const base = defaultEnabledOps();
   if (!input || typeof input !== "object") return base;
@@ -108,12 +164,17 @@ export function normalizeEnabledOps(input) {
 
 function isOpEnabled(enabledOps, reason) {
   if (reason === "random" || reason === "fallback") return true;
-  // 「露出下层」是翻层总开关：允许翻层可消与多步翻层两类结果。
-  if ((reason === "digMatch" || reason === "digReveal") && enabledOps.digLayer) {
-    return true;
-  }
   // setupReveal is a modifier, not a standalone move reason.
   if (reason === "setupReveal") return enabledOps.setupReveal !== false;
+  // digMatch / digReveal follow their own checkboxes. digLayer alone (both off)
+  // still allows either dig reason (legacy “任意翻层”).
+  if (reason === "digMatch" || reason === "digReveal") {
+    if (Object.prototype.hasOwnProperty.call(enabledOps, reason)) {
+      if (enabledOps[reason]) return true;
+      if (enabledOps[reason] === false) return false;
+    }
+    return enabledOps.digLayer !== false;
+  }
   if (!Object.prototype.hasOwnProperty.call(enabledOps, reason)) return true;
   return enabledOps[reason] !== false;
 }
@@ -379,7 +440,7 @@ function findFrontMatchPlans(shelves, maxLen = 4, enabledOps = null, random = nu
           plans.push({
             type: "plan",
             planKind: "setup3",
-            moves: newPath.map((m) => ({ ...m })),
+            moves: newPath,
             matchType: got,
             atomicCount: newPath.length,
             clearShelves,
@@ -512,8 +573,8 @@ const REVEAL_PAIR3_BONUS = 120;
 
 /**
  * How useful is the layer exposed by a clear/dig for the *next* elimination.
- * Empties, immediate dig-match, and pair-with-front when that id totals ≥3
- * across all fronts + this revealed layer.
+ * Empties, immediate dig-match, and when a revealed id totals ≥3
+ * across all fronts + all next layers (no need for a front pair already).
  */
 function scoreRevealQuality(before, after, reveals) {
   if (!reveals?.length) return { bonus: 0, parts: [], matchIds: [] };
@@ -527,7 +588,7 @@ function scoreRevealQuality(before, after, reveals) {
     parts.push(`顺带翻层可消(id${matchIds.join(",")})+${add}`);
   }
 
-  let pair3Applied = false;
+  let layer3Applied = false;
   for (const rev of reveals) {
     const shelf = rev.shelf;
     const layer = rev.layer || [];
@@ -537,7 +598,7 @@ function scoreRevealQuality(before, after, reveals) {
       parts.push(`选架#${shelf}下层+${empties * 28}`);
     }
 
-    if (pair3Applied) continue;
+    if (layer3Applied) continue;
     const revealedCounts = new Map();
     for (const id of layer) {
       if (!id || isSpecialClearId(id)) continue;
@@ -545,13 +606,13 @@ function scoreRevealQuality(before, after, reveals) {
     }
     for (const [id] of revealedCounts) {
       if (matchIds.includes(id)) continue;
-      // 凑对：其它架首层已有；≥3：全场首层(除本架旧首层) + 全场下一层
+      // 两层≥3：全场首层(除本架旧首层) + 全场下一层，不要求首层已凑对
       const priorFront = countFrontId(before, id, shelf);
       const total = priorFront + countNextLayerId(before, id);
-      if (priorFront >= 1 && total >= 3) {
+      if (total >= 3) {
         bonus += REVEAL_PAIR3_BONUS;
-        parts.push(`凑对且两层≥3(id${id})+${REVEAL_PAIR3_BONUS}`);
-        pair3Applied = true; // 同一步只计一次
+        parts.push(`两层≥3(id${id})+${REVEAL_PAIR3_BONUS}`);
+        layer3Applied = true; // 同一步只计一次
         break;
       }
     }
@@ -764,14 +825,14 @@ function findDigRevealPlans(shelves, maxLen = 4) {
         if (found.length >= 1) break;
         const next = cloneShelves(state);
         if (!applyAction(next, a)) continue;
-        const newPath = path.concat([a]);
+        const newPath = path.length ? path.concat([a]) : [a];
         const reveals = detectReveals(shelves, next).filter((r) => r.shelf === targetShelf);
         if (reveals.length) {
           const matchIds = digMatchIdsWithPrior(shelves, next, reveals);
           found.push({
             type: "plan",
             planKind: "dig",
-            moves: newPath.map((m) => ({ ...m })),
+            moves: newPath,
             atomicCount: newPath.length,
             reveals,
             canMatchPrior: matchIds.length > 0,
@@ -1106,43 +1167,40 @@ function applyPlan(shelves, plan) {
 }
 
 function rankGreedyActions(shelves, actions, random, topK = 5, enabledOps = defaultEnabledOps()) {
+  // Same-step score cache: identical actions must not be re-simulated.
+  const scoreCache = new Map();
+  const scoreCached = (action) => {
+    const key = actionKey(action);
+    let hit = scoreCache.get(key);
+    if (hit) return hit;
+    hit = scoreActionDetailed(shelves, action, enabledOps);
+    scoreCache.set(key, hit);
+    return hit;
+  };
+
   const specials = actions.filter((a) => a.type === "special");
   if (specials.length && isOpEnabled(enabledOps, "special")) {
+    const ranked = specials.slice(0, topK).map((action) => ({
+      action,
+      ...scoreCached(action),
+    }));
+    const pickFrom = specials.map((action) => ({
+      action,
+      ...scoreCached(action),
+    }));
     const chosen = pickRandom(specials, random);
-    return {
-      chosen,
-      ranked: specials.slice(0, topK).map((action) => ({
-        action,
-        ...scoreActionDetailed(shelves, action, enabledOps),
-      })),
-    };
+    return { chosen, ranked, pickFrom };
   }
 
   const scarce = isRevealScarce(shelves);
 
-  // Prefer clearing front triples before starting another dig — unless every
-  // setup3 / match3 candidate leaves the board with no legal moves (space lock).
-  const frontMatchPlans = isOpEnabled(enabledOps, "setup3")
-    ? findFrontMatchPlans(shelves, scarce ? 6 : 4, enabledOps, random)
-    : [];
-  const scoredSetup = frontMatchPlans
-    .map((plan) => ({
-      action: plan,
-      ...scorePlan(plan, shelves, enabledOps),
-    }))
-    .filter((s) => isOpEnabled(enabledOps, s.reason));
-  const hasViableSetup = scoredSetup.some((s) => !s.deadly);
-  const bestSetup = scoredSetup.reduce((m, s) => Math.max(m, s.score), -Infinity);
-
-  // Score atomics; if a strong viable setup exists, only fully score a shortlist.
+  // Score atomics first. If a 1-hand match3 already exists and exposure is not scarce,
+  // skip expensive multi-step setup search — pickFrom will prefer fewer hands anyway.
   let atomPool = actions.filter((a) => a.type !== "special");
-  if (hasViableSetup && bestSetup >= 600 && atomPool.length > 36 && !scarce) {
-    atomPool = atomPool.slice(0, 36);
-  }
   const scoredAtom = atomPool
     .map((action) => ({
       action,
-      ...scoreActionDetailed(shelves, action, enabledOps),
+      ...scoreCached(action),
     }))
     .filter((s) => isOpEnabled(enabledOps, s.reason));
   const hasViableMatch3 = scoredAtom.some(
@@ -1150,6 +1208,19 @@ function rankGreedyActions(shelves, actions, random, topK = 5, enabledOps = defa
       s.reason === "match3" &&
       !s.parts.some((p) => p.startsWith("消后无着") || p.startsWith("翻后无着")),
   );
+  // Non-scarce + viable 1-hand match3: skip multi-step setup search (same pickFrom via 最少手数).
+  const needSetupSearch = isOpEnabled(enabledOps, "setup3") && (scarce || !hasViableMatch3);
+
+  const frontMatchPlans = needSetupSearch
+    ? findFrontMatchPlans(shelves, scarce ? 6 : 4, enabledOps, random)
+    : [];
+  const scoredSetup = frontMatchPlans
+    .map((plan) => ({
+      action: plan,
+      ...scoreCached(plan),
+    }))
+    .filter((s) => isOpEnabled(enabledOps, s.reason));
+  const hasViableSetup = scoredSetup.some((s) => !s.deadly);
 
   let digPlans = [];
   const wantDigLayer = enabledOps.digLayer !== false;
@@ -1162,16 +1233,19 @@ function rankGreedyActions(shelves, actions, random, topK = 5, enabledOps = defa
     !hasViableMatch3
   ) {
     digPlans = findDigRevealPlans(shelves, 4).filter((p) => {
-      if (wantDigLayer) return true;
-      const isMatch = p.canMatchPrior && p.matchIds?.length;
-      return isMatch ? wantDigMatch : wantDigReveal;
+      const isMatch = Boolean(p.canMatchPrior && p.matchIds?.length);
+      // Respect digMatch / digReveal when set; digLayer-only → allow any dig plan.
+      if (wantDigMatch || wantDigReveal) {
+        return isMatch ? wantDigMatch : wantDigReveal;
+      }
+      return wantDigLayer;
     });
   }
 
   const scoredDig = digPlans
     .map((plan) => ({
       action: plan,
-      ...scorePlan(plan, shelves, enabledOps),
+      ...scoreCached(plan),
     }))
     .filter((s) => isOpEnabled(enabledOps, s.reason));
 
@@ -1204,14 +1278,14 @@ function rankGreedyActions(shelves, actions, random, topK = 5, enabledOps = defa
       .filter((a) => a.type !== "special" || isOpEnabled(enabledOps, "special"))
       .map((action) => ({
         action,
-        ...scoreActionDetailed(shelves, action, enabledOps),
+        ...scoreCached(action),
       }))
       .filter((s) => isOpEnabled(enabledOps, s.reason));
     scored.sort((a, b) => b.score - a.score);
   }
 
   if (!scored.length) {
-    return { chosen: null, ranked: [] };
+    return { chosen: null, ranked: [], pickFrom: [] };
   }
 
   const best = scored[0]?.score ?? -Infinity;
@@ -1231,7 +1305,7 @@ function rankGreedyActions(shelves, actions, random, topK = 5, enabledOps = defa
     random,
   );
 
-  return { chosen, ranked: scored.slice(0, topK) };
+  return { chosen, ranked: scored.slice(0, topK), pickFrom };
 }
 
 export function playout(rawLevel, options = {}) {
@@ -1488,6 +1562,434 @@ export function playout(rawLevel, options = {}) {
   }
 }
 
+function actionHandCount(action) {
+  if (!action) return 1;
+  if (action.type === "plan") return action.atomicCount || action.moves?.length || 1;
+  return 1;
+}
+
+function makeForkNode(rawLevel, enabledOps) {
+  const state = createState(rawLevel);
+  return {
+    shelves: state.shelves,
+    moves: 0,
+    logicSteps: 0,
+    loops: 0,
+    stallSteps: 0,
+    bestProgress: 0,
+    pathHash: 2166136261 >>> 0,
+    seen: new Set([hashShelves(state.shelves)]),
+    trace: [],
+    forkPath: [],
+    forkPoints: [],
+    truncatedAt: null,
+  };
+}
+
+function cloneForkNode(node) {
+  // Trace steps / fork metadata are append-only; share prior entries across branches.
+  return {
+    shelves: cloneShelves(node.shelves),
+    moves: node.moves,
+    logicSteps: node.logicSteps,
+    loops: node.loops,
+    stallSteps: node.stallSteps,
+    bestProgress: node.bestProgress,
+    pathHash: node.pathHash,
+    seen: new Set(node.seen),
+    trace: node.trace.slice(),
+    forkPath: node.forkPath.slice(),
+    forkPoints: node.forkPoints.slice(),
+    truncatedAt: node.truncatedAt,
+  };
+}
+
+function mixPathHash(pathHash, action, logicSteps) {
+  const key = actionKey(action);
+  let h = pathHash >>> 0;
+  for (let i = 0; i < key.length; i += 1) {
+    h = Math.imul(h ^ key.charCodeAt(i), 16777619) >>> 0;
+  }
+  return Math.imul(h ^ (logicSteps + 1), 16777619) >>> 0;
+}
+
+function tryApplyForkAction(node, action, detail, ranked, _revealBefore, candidates, forkMeta) {
+  const snapshot = cloneShelves(node.shelves);
+  const ok = action.type === "plan" ? applyPlan(snapshot, action) : applyAction(snapshot, action);
+  if (!ok) return null;
+  const h = hashShelves(snapshot);
+  if (node.seen.has(h)) return null;
+  const atomicCount = actionHandCount(action);
+  if (node.moves + atomicCount > forkMeta.maxMoves) return null;
+
+  const next = cloneForkNode(node);
+  next.shelves = snapshot;
+  next.seen.add(h);
+  next.pathHash = mixPathHash(next.pathHash, action, next.logicSteps);
+  next.moves += atomicCount;
+  next.logicSteps += 1;
+
+  const parts = detail?.parts ? [...detail.parts] : [];
+  if (forkMeta.forkWidth > 1) {
+    parts.push(`同分分叉×${forkMeta.forkWidth}`);
+  }
+  // Slim trace during search: no boards / reveal stats / describe strings.
+  // hydrateForkLeafTrace() fills those when the UI opens a branch.
+  const chosenKey = actionKey(action);
+  next.trace.push({
+    step: next.logicSteps,
+    atomicCount,
+    movesTotal: next.moves,
+    action,
+    score: detail?.score ?? 0,
+    reason: detail?.reason ?? "move",
+    parts,
+    candidates,
+    skippedLoops: 0,
+    wasPreferred: true,
+    top: (ranked || []).slice(0, 5).map((r) => ({
+      score: r.score,
+      reason: r.reason,
+      selected: actionKey(r.action) === chosenKey,
+      action: r.action,
+    })),
+    progress: forkMeta.itemsStart
+      ? (forkMeta.itemsStart - countItems(next.shelves)) / forkMeta.itemsStart
+      : 0,
+    itemsLeft: countItems(next.shelves),
+    forkWidth: forkMeta.forkWidth,
+  });
+
+  if (forkMeta.forkWidth > 1) {
+    next.forkPoints.push({
+      step: next.logicSteps,
+      score: detail?.score ?? 0,
+      candidates: forkMeta.forkWidth,
+      chosenIndex: forkMeta.choiceIndex,
+    });
+    next.forkPath.push(`L${next.logicSteps}#${forkMeta.choiceIndex + 1}/${forkMeta.forkWidth}`);
+  }
+
+  const progressNow = forkMeta.itemsStart
+    ? (forkMeta.itemsStart - countItems(next.shelves)) / forkMeta.itemsStart
+    : 0;
+  if (progressNow > next.bestProgress + 1e-9) {
+    next.bestProgress = progressNow;
+    next.stallSteps = 0;
+  } else {
+    next.stallSteps += 1;
+  }
+  return next;
+}
+
+function finishForkLeaf(node, result, itemsStart, branchId) {
+  const left = result === "win" ? 0 : countItems(node.shelves);
+  const progress = result === "win" ? 1 : itemsStart ? (itemsStart - left) / itemsStart : 0;
+  return {
+    result,
+    moves: node.moves,
+    logicSteps: node.logicSteps,
+    itemsStart,
+    itemsLeft: left,
+    layersLeft: result === "win" ? 0 : countLayers(node.shelves),
+    progress,
+    loops: node.loops,
+    seed: 0,
+    pathKey: `${result}|${node.moves}|${node.logicSteps}|${node.pathHash >>> 0}|${node.forkPath.join(">")}`,
+    trialIndex: branchId,
+    branchId,
+    forkPath: node.forkPath.join(" → ") || "主路",
+    deathStep: result === "win" ? null : node.logicSteps,
+    forkPoints: node.forkPoints,
+    truncated: Boolean(node.truncatedAt),
+    truncatedAt: node.truncatedAt,
+    trace: node.trace,
+    slimTrace: true,
+  };
+}
+
+/**
+ * Fill boards / captions on a slim fork leaf trace by replaying stored actions.
+ * Mutates leaf.trace in place; safe to call multiple times (no-op if already hydrated).
+ */
+export function hydrateForkLeafTrace(rawLevel, leaf, options = {}) {
+  if (!leaf || !Array.isArray(leaf.trace) || !leaf.trace.length) return leaf;
+  if (leaf.trace[0]?.before && leaf.trace[0]?.after && leaf.trace[0]?.text) {
+    leaf.slimTrace = false;
+    return leaf;
+  }
+
+  const shelves = createState(rawLevel).shelves;
+  const itemsStart = leaf.itemsStart || countItems(shelves);
+
+  for (const step of leaf.trace) {
+    const action = step.action;
+    const revealBefore = estimateRevealChances(shelves);
+    const before = snapshotBoard(shelves);
+    if (action) {
+      if (action.type === "plan") applyPlan(shelves, action);
+      else applyAction(shelves, action);
+    }
+    const revealAfter = estimateRevealChances(shelves);
+    step.before = before;
+    step.after = snapshotBoard(shelves);
+    step.highlight = highlightForAction(action);
+    step.text = step.text || describeAction(action);
+    step.revealChancesBefore = revealBefore.chances;
+    step.revealChances = revealAfter.chances;
+    step.revealEmpties = revealAfter.empties;
+    step.revealDigChances = revealAfter.digChances;
+    step.revealMatchGroups = revealAfter.matchGroups;
+    step.revealScarce = revealAfter.diggable > 0 && revealAfter.chances <= 2;
+    if (action?.type === "plan") {
+      step.submoves = (action.moves || []).map((m, i) => ({
+        i: i + 1,
+        text: describeAction(m),
+        highlight: highlightForAction(m),
+      }));
+    }
+    if (Array.isArray(step.top)) {
+      step.top = step.top.map((t) => ({
+        text: t.text || describeAction(t.action),
+        score: t.score,
+        reason: t.reason,
+        selected: Boolean(t.selected),
+      }));
+    }
+    if (step.progress == null && itemsStart) {
+      step.progress = (itemsStart - countItems(shelves)) / itemsStart;
+    }
+  }
+  leaf.slimTrace = false;
+  return leaf;
+}
+
+/**
+ * Single-start tree: at each step fork all top-score pickFrom actions (capped).
+ * @returns {{ results: object[], truncated: boolean, exploredLeaves: number }}
+ */
+export function analyzeForkTree(rawLevel, options = {}) {
+  const maxMoves = options.maxMoves ?? 2500;
+  const maxBranches = Math.max(1, options.maxBranches ?? 64);
+  const maxForkWidth = Math.max(1, options.maxForkWidth ?? 8);
+  const enabledOps = normalizeEnabledOps(options.enabledOps);
+  const topK = options.topK ?? 5;
+  const random = rng(options.seed ?? 1);
+
+  const root = makeForkNode(rawLevel, enabledOps);
+  const itemsStart = countItems(root.shelves);
+  const frontier = [root];
+  const leaves = [];
+  let truncated = false;
+
+  while (frontier.length && leaves.length < maxBranches) {
+    const node = frontier.shift();
+    if (isWon(node.shelves)) {
+      leaves.push(finishForkLeaf(node, "win", itemsStart, leaves.length));
+      continue;
+    }
+    const actions = listActions(node.shelves);
+    if (isBoardFailed(node.shelves) || actions.length === 0) {
+      leaves.push(finishForkLeaf(node, "deadlock", itemsStart, leaves.length));
+      continue;
+    }
+    if (node.moves >= maxMoves) {
+      leaves.push(finishForkLeaf(node, "limit", itemsStart, leaves.length));
+      continue;
+    }
+    if (node.loops >= 80 || node.stallSteps >= 250) {
+      leaves.push(finishForkLeaf(node, "deadlock", itemsStart, leaves.length));
+      continue;
+    }
+
+    const ranking = rankGreedyActions(node.shelves, actions, random, topK, enabledOps);
+    let pickFrom = ranking.pickFrom?.length
+      ? ranking.pickFrom
+      : ranking.chosen
+        ? [{ action: ranking.chosen, ...scoreActionDetailed(node.shelves, ranking.chosen, enabledOps) }]
+        : [];
+
+    if (!pickFrom.length) {
+      leaves.push(finishForkLeaf(node, "deadlock", itemsStart, leaves.length));
+      continue;
+    }
+
+    let widthTruncated = false;
+    if (pickFrom.length > maxForkWidth) {
+      pickFrom = pickFrom.slice(0, maxForkWidth);
+      widthTruncated = true;
+      truncated = true;
+    }
+
+    const forkWidth = pickFrom.length;
+    const children = [];
+    for (let i = 0; i < pickFrom.length; i += 1) {
+      if (leaves.length + frontier.length + children.length >= maxBranches * 2) {
+        truncated = true;
+        break;
+      }
+      const entry = pickFrom[i];
+      const child = tryApplyForkAction(
+        node,
+        entry.action,
+        entry,
+        ranking.ranked,
+        null,
+        actions.length,
+        {
+          maxMoves,
+          itemsStart,
+          forkWidth,
+          choiceIndex: i,
+        },
+      );
+      if (child) {
+        if (widthTruncated && !child.truncatedAt) {
+          child.truncatedAt = child.logicSteps;
+        }
+        children.push(child);
+      }
+    }
+
+    if (!children.length) {
+      // Fall back like playout: try remaining ranked / any legal action (no extra fork).
+      let rescued = null;
+      for (const r of ranking.ranked || []) {
+        rescued = tryApplyForkAction(
+          node,
+          r.action,
+          r,
+          ranking.ranked,
+          null,
+          actions.length,
+          { maxMoves, itemsStart, forkWidth: 1, choiceIndex: 0 },
+        );
+        if (rescued) break;
+      }
+      if (!rescued) {
+        for (const action of actions) {
+          const detail = scoreActionDetailed(node.shelves, action, enabledOps);
+          if (!isOpEnabled(enabledOps, detail.reason)) continue;
+          rescued = tryApplyForkAction(
+            node,
+            action,
+            detail,
+            ranking.ranked,
+            null,
+            actions.length,
+            { maxMoves, itemsStart, forkWidth: 1, choiceIndex: 0 },
+          );
+          if (rescued) break;
+        }
+      }
+      if (rescued) frontier.push(rescued);
+      else leaves.push(finishForkLeaf(node, "deadlock", itemsStart, leaves.length));
+      continue;
+    }
+
+    // Prefer expanding fewer children when near branch cap.
+    const room = maxBranches - leaves.length;
+    if (frontier.length + children.length > room && room > 0) {
+      // Keep expanding but stop accepting new forks beyond cap by converting excess to leaves later.
+      truncated = truncated || children.length > 1;
+    }
+    for (const child of children) {
+      if (leaves.length >= maxBranches) {
+        truncated = true;
+        break;
+      }
+      frontier.push(child);
+    }
+  }
+
+  // Cap: unfinished frontier nodes become truncated leaves at current position.
+  while (frontier.length && leaves.length < maxBranches) {
+    const node = frontier.shift();
+    node.truncatedAt = node.truncatedAt ?? node.logicSteps;
+    truncated = true;
+    const result =
+      isWon(node.shelves) ? "win" : node.moves >= maxMoves ? "limit" : "deadlock";
+    leaves.push(finishForkLeaf(node, result, itemsStart, leaves.length));
+  }
+  if (frontier.length) truncated = true;
+
+  return { results: leaves, truncated, exploredLeaves: leaves.length, itemsStart };
+}
+
+/**
+ * Async fork analysis with UI yields + buildReport.
+ */
+export async function analyzeForkAsync(rawLevel, options = {}) {
+  const maxBranches = Math.max(1, options.maxBranches ?? options.trials ?? 64);
+  const maxForkWidth = Math.max(1, options.maxForkWidth ?? 8);
+  const maxMoves = options.maxMoves ?? 2500;
+  const seed0 = options.seed ?? 42;
+  const enabledOps = normalizeEnabledOps(options.enabledOps);
+  const onProgress = options.onProgress;
+  const chunkSize = Math.max(1, options.chunkSize ?? 4);
+
+  const state0 = createState(rawLevel);
+  const profile = staticProfile(state0.shelves);
+  const config = {
+    mode: "fork",
+    trials: maxBranches,
+    maxBranches,
+    maxForkWidth,
+    strategy: "greedy",
+    maxMoves,
+    seed: seed0,
+    enabledOps,
+  };
+
+  // Run tree synchronously in slices via generator-style chunking on frontier size.
+  // For simplicity: compute full tree then report progress as complete (tree is usually small).
+  const startedAt = performance.now();
+  if (onProgress) {
+    onProgress({
+      done: 0,
+      total: maxBranches,
+      elapsedMs: 0,
+      etaMs: 0,
+      msPerTrial: 0,
+    });
+  }
+  await yieldToUi();
+
+  const tree = analyzeForkTree(rawLevel, {
+    maxBranches,
+    maxForkWidth,
+    maxMoves,
+    seed: seed0,
+    enabledOps,
+    topK: 5,
+  });
+
+  if (onProgress) {
+    onProgress({
+      done: tree.exploredLeaves,
+      total: tree.exploredLeaves,
+      elapsedMs: performance.now() - startedAt,
+      etaMs: 0,
+      msPerTrial:
+        tree.exploredLeaves > 0
+          ? (performance.now() - startedAt) / tree.exploredLeaves
+          : 0,
+    });
+  }
+
+  // Tiny yield so UI can paint progress=done before report render.
+  if (chunkSize) await yieldToUi();
+
+  const report = buildReport(tree.results, profile, {
+    ...config,
+    truncated: tree.truncated,
+    exploredLeaves: tree.exploredLeaves,
+  });
+  report.summary.forkMode = true;
+  report.summary.truncated = tree.truncated;
+  return report;
+}
+
 export { describeAction, scoreActionDetailed, findFrontMatchPlans, findDigRevealPlans };
 
 function percentile(sorted, p) {
@@ -1615,7 +2117,14 @@ export async function analyzeLevelAsync(rawLevel, options = {}) {
 
   const state0 = createState(rawLevel);
   const profile = staticProfile(state0.shelves);
-  const config = { trials, strategy, maxMoves, seed: seed0, enabledOps };
+  const config = {
+    mode: "montecarlo",
+    trials,
+    strategy,
+    maxMoves,
+    seed: seed0,
+    enabledOps,
+  };
 
   const results = [];
   const startedAt = performance.now();

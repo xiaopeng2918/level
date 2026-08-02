@@ -4,8 +4,8 @@
  * Heavy simulation runs in a Web Worker so the page stays responsive.
  */
 
-import { defaultEnabledOps, normalizeEnabledOps } from "./analyze.js?v=20260801k";
-import { analyzeLevelOffMain, terminateAnalyzeWorker } from "./analyze-client.js?v=20260801k";
+import { defaultEnabledOps, normalizeEnabledOps } from "./analyze.js?v=20260802k";
+import { analyzeLevelOffMain, terminateAnalyzeWorker } from "./analyze-client.js?v=20260802k";
 
 function readEnabledOpsFromUi() {
   const ops = defaultEnabledOps();

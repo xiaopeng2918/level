@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=Nunito:wght@600;700;800&family=Outfit:wght@500;700;800&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="styles.css?v=20260801k" />
+    <link rel="stylesheet" href="styles.css?v=20260802m" />
   </head>
   <body>
     <div class="app">
@@ -70,8 +70,15 @@
           </div>
           <div class="level-panel-actions">
             <button class="ghost-btn" id="btnSample" type="button">填入示例</button>
-            <label class="trials-label" for="analyzeTrials">
-              模拟局数
+            <label class="trials-label" for="analyzeMode">
+              分析模式
+              <select id="analyzeMode" class="trials-input analyze-mode-select">
+                <option value="montecarlo" selected>多局统计</option>
+                <option value="fork">单局分叉</option>
+              </select>
+            </label>
+            <label class="trials-label" for="analyzeTrials" id="analyzeTrialsLabel">
+              <span id="analyzeTrialsLabelText">模拟局数</span>
               <input
                 id="analyzeTrials"
                 class="trials-input"
@@ -96,12 +103,19 @@
           <div class="sim-ops-head">
             <div>
               <h3>模拟可用操作</h3>
-              <p>勾选表示分析难度 / 批量模拟时允许使用该策略；取消勾选则禁止。分值用于贪心比较候选，同分则随机。</p>
+              <p>勾选表示分析难度 / 批量模拟时允许使用该策略；取消勾选则禁止。可用「操作水平」一键套用简单→超困难组合；分值用于贪心比较候选，同分则随机。</p>
             </div>
             <div class="sim-ops-actions">
               <button class="ghost-btn" id="btnSimOpsAll" type="button">全选</button>
               <button class="ghost-btn" id="btnSimOpsNone" type="button">全不选</button>
             </div>
+          </div>
+          <div class="sim-ops-presets" id="simOpsPresets" role="group" aria-label="操作水平预设">
+            <span class="sim-ops-presets-label">操作水平</span>
+            <button type="button" class="ghost-btn sim-ops-preset-btn" data-ops-preset="easy">简单</button>
+            <button type="button" class="ghost-btn sim-ops-preset-btn" data-ops-preset="normal">普通</button>
+            <button type="button" class="ghost-btn sim-ops-preset-btn" data-ops-preset="hard">困难</button>
+            <button type="button" class="ghost-btn sim-ops-preset-btn" data-ops-preset="ultra">超困难</button>
           </div>
           <div class="sim-ops-list" id="simOpsList"></div>
         </div>
@@ -163,9 +177,9 @@
       </div>
     </div>
 
-    <script type="module" src="game.js?v=20260801k"></script>
+    <script type="module" src="game.js?v=20260802k"></script>
     <script type="module">
-      import("/batch.js?v=20260801k").catch((err) => {
+      import("/batch.js?v=20260802k").catch((err) => {
         const el = document.getElementById("batchStatus");
         if (el) el.textContent = "批量脚本加载失败：" + (err && err.message ? err.message : err);
         console.error(err);

@@ -1,5 +1,13 @@
-import { analyzeLevelAsync, playout, SIM_OP_DEFS, defaultEnabledOps, normalizeEnabledOps } from "./analyze.js?v=20260801k";
-import { analyzeLevelOffMain } from "./analyze-client.js?v=20260801k";
+import {
+  analyzeLevelAsync,
+  playout,
+  hydrateForkLeafTrace,
+  SIM_OP_DEFS,
+  SIM_OP_PRESETS,
+  defaultEnabledOps,
+  normalizeEnabledOps,
+} from "./analyze.js?v=20260802k";
+import { analyzeLevelOffMain } from "./analyze-client.js?v=20260802k";
 
 const TRIPLE_WIDTH = 3;
 const SINGLE_WIDTH = 1;
@@ -177,7 +185,9 @@ const els = {
   btnRestart: document.getElementById("btnRestart"),
   btnSample: document.getElementById("btnSample"),
   btnAnalyze: document.getElementById("btnAnalyze"),
+  analyzeMode: document.getElementById("analyzeMode"),
   analyzeTrials: document.getElementById("analyzeTrials"),
+  analyzeTrialsLabelText: document.getElementById("analyzeTrialsLabelText"),
   btnLoadLevel: document.getElementById("btnLoadLevel"),
   levelInput: document.getElementById("levelInput"),
   levelError: document.getElementById("levelError"),
@@ -1269,6 +1279,14 @@ function pct(n) {
   return `${Math.round(n * 1000) / 10}%`;
 }
 
+function escapeHtml(text) {
+  return String(text ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
 function formatDuration(ms) {
   if (!Number.isFinite(ms) || ms < 0) return "—";
   if (ms < 1000) return `${Math.max(1, Math.round(ms))} 毫秒`;
@@ -1328,6 +1346,7 @@ function renderSimOpsPanel() {
       <span class="sim-op-score"><strong>分值</strong> ${op.score}</span>
     </label>`,
   ).join("");
+  syncSimOpsPresetButtons();
 }
 
 function setAllSimOps(checked) {
@@ -1336,9 +1355,42 @@ function setAllSimOps(checked) {
     input.checked = checked;
   });
   saveEnabledOps(readEnabledOpsFromUi());
+  syncSimOpsPresetButtons();
+}
+
+function applySimOpsPreset(presetId) {
+  const preset = SIM_OP_PRESETS[presetId];
+  if (!preset || !els.simOpsList) return;
+  const ops = normalizeEnabledOps(preset.ops);
+  els.simOpsList.querySelectorAll('input[data-sim-op]').forEach((input) => {
+    input.checked = Boolean(ops[input.dataset.simOp]);
+  });
+  saveEnabledOps(ops);
+  syncSimOpsPresetButtons(presetId);
+}
+
+function matchSimOpsPresetId(ops) {
+  const normalized = normalizeEnabledOps(ops);
+  for (const [id, preset] of Object.entries(SIM_OP_PRESETS)) {
+    const want = normalizeEnabledOps(preset.ops);
+    const same = SIM_OP_DEFS.every((op) => Boolean(want[op.id]) === Boolean(normalized[op.id]));
+    if (same) return id;
+  }
+  return null;
+}
+
+function syncSimOpsPresetButtons(forcedId) {
+  const activeId = forcedId ?? matchSimOpsPresetId(readEnabledOpsFromUi());
+  document.querySelectorAll(".sim-ops-preset-btn").forEach((btn) => {
+    btn.classList.toggle("is-active", btn.dataset.opsPreset === activeId);
+  });
 }
 
 function enabledOpsSummary(ops) {
+  const presetId = matchSimOpsPresetId(ops);
+  if (presetId && SIM_OP_PRESETS[presetId]) {
+    return `操作水平·${SIM_OP_PRESETS[presetId].label}`;
+  }
   const on = SIM_OP_DEFS.filter((op) => ops[op.id]).map((op) => op.label);
   if (on.length === SIM_OP_DEFS.length) return "全部操作";
   if (!on.length) return "无操作";
@@ -1373,22 +1425,49 @@ const analyzeSession = {
   traceBoards: null,
 };
 
+function readAnalyzeMode() {
+  return els.analyzeMode?.value === "fork" ? "fork" : "montecarlo";
+}
+
+function syncAnalyzeModeUi() {
+  const fork = readAnalyzeMode() === "fork";
+  if (els.analyzeTrialsLabelText) {
+    els.analyzeTrialsLabelText.textContent = fork ? "最大支路数" : "模拟局数";
+  }
+  if (els.analyzeTrials) {
+    els.analyzeTrials.min = fork ? "1" : "10";
+    els.analyzeTrials.max = fork ? "256" : "50000";
+    els.analyzeTrials.step = fork ? "1" : "10";
+    if (fork && Number(els.analyzeTrials.value) > 256) els.analyzeTrials.value = "64";
+    if (fork && Number(els.analyzeTrials.value) < 1) els.analyzeTrials.value = "64";
+    if (!fork && Number(els.analyzeTrials.value) < 10) els.analyzeTrials.value = "120";
+  }
+}
+
 function readAnalyzeTrials() {
+  const fork = readAnalyzeMode() === "fork";
   const raw = Number(els.analyzeTrials?.value);
-  if (!Number.isFinite(raw)) return 120;
+  if (!Number.isFinite(raw)) return fork ? 64 : 120;
+  if (fork) return Math.min(256, Math.max(1, Math.round(raw)));
   return Math.min(50000, Math.max(10, Math.round(raw)));
 }
 
+function isForkReport(report = analyzeSession.report) {
+  return report?.config?.mode === "fork" || report?.summary?.forkMode === true;
+}
+
 function renderAnalyzeProgress({ done, total, elapsedMs, etaMs, msPerTrial }) {
+  const fork = readAnalyzeMode() === "fork";
+  const unit = fork ? "支路" : "局";
   const pctDone = total ? Math.round((done / total) * 1000) / 10 : 0;
   const etaText =
     done < 3
       ? "预估中…"
-      : `预计剩余 ${formatDuration(etaMs)}（约 ${msPerTrial.toFixed(0)} 毫秒/局）`;
+      : `预计剩余 ${formatDuration(etaMs)}（约 ${msPerTrial.toFixed(0)} 毫秒/${unit}）`;
 
   els.analyzeResult.innerHTML = `
     <div class="analyze-progress">
-      <p>模拟中：贪心 × ${total} 局 · 仅移动</p>
+      <p>${fork ? `分叉中：最多 ${total} 条支路 · 贪心同分全展开` : `模拟中：贪心 × ${total} 局 · 仅移动`}</p>
       <div class="analyze-progress-bar" aria-hidden="true">
         <span style="width:${pctDone}%"></span>
       </div>
@@ -1406,6 +1485,346 @@ function filteredTrials() {
   return results.filter((r) => r.result === analyzeSession.filter);
 }
 
+/** @returns {{ step: number, choice: number, width: number, key: string }[]} */
+function parseForkSegments(forkPath) {
+  if (!forkPath || forkPath === "主路") return [];
+  return String(forkPath)
+    .split(/\s*→\s*/)
+    .map((raw) => {
+      const m = raw.trim().match(/^L(\d+)#(\d+)\/(\d+)$/);
+      if (!m) return { step: 0, choice: 0, width: 0, key: raw.trim() };
+      return {
+        step: Number(m[1]),
+        choice: Number(m[2]),
+        width: Number(m[3]),
+        key: raw.trim(),
+      };
+    })
+    .filter((s) => s.key);
+}
+
+/**
+ * Build a prefix tree from branch forkPath segments.
+ * @returns {{ children: Map<string, any>, leaves: any[], segment: null }}
+ */
+function buildForkTree(results) {
+  const root = { children: new Map(), leaves: [], segment: null };
+  for (const r of results) {
+    const segs = parseForkSegments(r.forkPath);
+    let node = root;
+    for (const seg of segs) {
+      if (!node.children.has(seg.key)) {
+        node.children.set(seg.key, { segment: seg, children: new Map(), leaves: [] });
+      }
+      node = node.children.get(seg.key);
+    }
+    node.leaves.push(r);
+  }
+  return root;
+}
+
+function forkLeafMeta(r) {
+  const death =
+    r.result === "win"
+      ? "通关"
+      : r.deathStep != null
+        ? `死于逻辑步 ${r.deathStep}`
+        : "未通关";
+  return { death, fullPath: r.forkPath && r.forkPath !== "主路" ? r.forkPath : "主路（无同分分叉）" };
+}
+
+/** Stable key so shared prefixes across branches merge into one node. */
+function forkTraceStepKey(step) {
+  if (step?.action && typeof step.action === "object") {
+    try {
+      return JSON.stringify(step.action);
+    } catch {
+      /* fall through */
+    }
+  }
+  return `${step?.step ?? "?"}|${step?.text || step?.reason || ""}`;
+}
+
+/**
+ * Build diagram from full per-branch traces: every logic step is a node.
+ * kind: root | step (unique best) | fork (score-tie split) | leaf
+ */
+function buildStepDiagramFromResults(results) {
+  let seq = 0;
+  const root = {
+    id: "root",
+    kind: "root",
+    label: "开局",
+    sub: "逐步",
+    title: "开局",
+    edgeLabel: "",
+    isFork: false,
+    children: [],
+    childMap: new Map(),
+  };
+
+  for (const r of results) {
+    const steps = Array.isArray(r.trace) ? r.trace : [];
+    const forkByStep = new Map((r.forkPoints || []).map((p) => [p.step, p]));
+    let parent = root;
+
+    for (const step of steps) {
+      const key = forkTraceStepKey(step);
+      const fp = forkByStep.get(step.step);
+      const isFork = Boolean(fp) || (step.forkWidth != null && step.forkWidth > 1);
+      const width = fp?.candidates || step.forkWidth || 0;
+      const choice = fp != null ? (fp.chosenIndex ?? 0) + 1 : null;
+      const edgeLabel = isFork && choice != null && width > 0 ? `#${choice}/${width}` : "";
+
+      if (!parent.childMap.has(key)) {
+        const reason = REASON_LABEL[step.reason] || step.reason || "走子";
+        const node = {
+          id: `s-${seq++}`,
+          kind: isFork ? "fork" : "step",
+          label: `L${step.step}`,
+          sub: isFork ? `分叉×${width || "?"}` : reason,
+          title: `${isFork ? "【同分分叉】" : "【唯一最优】"}${step.text || reason}`,
+          edgeLabel,
+          step: step.step,
+          isFork,
+          children: [],
+          childMap: new Map(),
+        };
+        parent.childMap.set(key, node);
+        parent.children.push(node);
+      }
+      parent = parent.childMap.get(key);
+    }
+
+    const leafKey = `leaf:${r.trialIndex}`;
+    if (!parent.childMap.has(leafKey)) {
+      const { death, fullPath } = forkLeafMeta(r);
+      const leaf = {
+        id: `leaf-${seq++}`,
+        kind: "leaf",
+        trialIndex: r.trialIndex,
+        branchId: r.branchId ?? r.trialIndex,
+        result: r.result,
+        label: `#${r.branchId ?? r.trialIndex}`,
+        sub: death,
+        title: `${RESULT_LABEL[r.result] || r.result} · ${fullPath}`,
+        edgeLabel: "",
+        isFork: false,
+        children: [],
+        childMap: new Map(),
+      };
+      parent.childMap.set(leafKey, leaf);
+      parent.children.push(leaf);
+    }
+  }
+
+  return root;
+}
+
+/**
+ * Horizontal layout: leaf slots on Y, parents at mean of children.
+ */
+function layoutForkDiagram(rootDiag, selectedTrialIndex) {
+  const H_GAP = 78;
+  const V_GAP = 50;
+  const PAD_X = 20;
+  const PAD_Y = 24;
+  const NODE_W = { root: 56, step: 64, fork: 72, leaf: 132 };
+  const NODE_H = 40;
+
+  let leafSlot = 0;
+  const all = [];
+
+  const place = (node, depth) => {
+    node.depth = depth;
+    node.w = NODE_W[node.kind] || 64;
+    node.h = NODE_H;
+    all.push(node);
+    if (!node.children.length) {
+      node.row = leafSlot++;
+      return;
+    }
+    for (const c of node.children) place(c, depth + 1);
+    node.row = node.children.reduce((s, c) => s + c.row, 0) / node.children.length;
+  };
+  place(rootDiag, 0);
+
+  let maxDepth = 0;
+  for (const n of all) {
+    n.x = PAD_X + n.depth * H_GAP;
+    n.y = PAD_Y + n.row * V_GAP;
+    maxDepth = Math.max(maxDepth, n.depth);
+  }
+
+  const parentOf = new Map();
+  for (const n of all) {
+    for (const c of n.children) parentOf.set(c.id, n);
+  }
+  const selectedPath = new Set();
+  if (selectedTrialIndex != null) {
+    const leaf = all.find((n) => n.kind === "leaf" && n.trialIndex === selectedTrialIndex);
+    let cur = leaf;
+    while (cur) {
+      selectedPath.add(cur.id);
+      cur = parentOf.get(cur.id);
+    }
+  }
+
+  const width = PAD_X * 2 + maxDepth * H_GAP + NODE_W.leaf;
+  const height = PAD_Y * 2 + Math.max(1, leafSlot) * V_GAP;
+  return { nodes: all, width, height, selectedPath, nodeH: NODE_H };
+}
+
+/**
+ * Minimal strip overview: one row per branch, cells = logic steps.
+ * Green = unique best, orange = fork; click row opens that branch.
+ */
+function renderForkStripHtml(results) {
+  const sorted = [...results].sort(
+    (a, b) => (a.branchId ?? a.trialIndex) - (b.branchId ?? b.trialIndex),
+  );
+  const maxSteps = Math.max(1, ...sorted.map((r) => (r.trace || []).length));
+  const selected = analyzeSession.selectedIndex;
+
+  const rows = sorted
+    .map((r) => {
+      const steps = r.trace || [];
+      const forkByStep = new Map((r.forkPoints || []).map((p) => [p.step, p]));
+      const active = selected === r.trialIndex ? " is-active" : "";
+      const { death, fullPath } = forkLeafMeta(r);
+      const cells = steps
+        .map((step) => {
+          const isFork =
+            forkByStep.has(step.step) || (step.forkWidth != null && step.forkWidth > 1);
+          const fp = forkByStep.get(step.step);
+          const tip = isFork
+            ? `L${step.step} 同分分叉×${fp?.candidates || step.forkWidth || "?"}${
+                fp != null ? ` #${(fp.chosenIndex ?? 0) + 1}/${fp.candidates}` : ""
+              }`
+            : `L${step.step} 唯一最优 · ${REASON_LABEL[step.reason] || step.reason || ""}`;
+          return `<i class="fork-strip-cell${isFork ? " is-fork" : " is-step"}" title="${escapeHtml(tip)}"></i>`;
+        })
+        .join("");
+      const pad =
+        steps.length < maxSteps
+          ? `<i class="fork-strip-pad" style="flex:${maxSteps - steps.length}"></i>`
+          : "";
+      return `<button type="button" class="fork-strip-row trial-row${active}" data-trial="${r.trialIndex}" title="${escapeHtml(fullPath)}">
+        <span class="fork-strip-id">#${r.branchId ?? r.trialIndex}</span>
+        <span class="fork-strip-track" style="--strip-steps:${maxSteps}">${cells}${pad}</span>
+        <span class="fork-strip-end trial-result trial-${r.result}">${escapeHtml(death)}</span>
+      </button>`;
+    })
+    .join("");
+
+  return `<div class="fork-strip-wrap">
+    <div class="fork-strip-head">
+      <strong>支路缩略</strong>
+      <span>一行一支路 · 横轴逻辑步 · <em class="c-step">绿非分叉</em> / <em class="c-fork">橙分叉</em> · 点击行查看</span>
+    </div>
+    <div class="fork-strip-scroll">${rows}</div>
+  </div>`;
+}
+
+/** SVG tree: every logic step; click leaf → green=非分叉, orange=分叉. */
+function renderForkTreeHtml(results) {
+  const diag = buildStepDiagramFromResults(results);
+  const { nodes, width, height, selectedPath, nodeH } = layoutForkDiagram(
+    diag,
+    analyzeSession.selectedIndex,
+  );
+  const hasSelection = selectedPath.size > 0;
+
+  const edges = [];
+  for (const n of nodes) {
+    for (const c of n.children) {
+      const x1 = n.x + n.w;
+      const y1 = n.y + nodeH / 2;
+      const x2 = c.x;
+      const y2 = c.y + nodeH / 2;
+      const mid = (x1 + x2) / 2;
+      const onPath = selectedPath.has(n.id) && selectedPath.has(c.id);
+      const edgeKind =
+        onPath && c.kind === "fork"
+          ? " is-path is-path-fork"
+          : onPath && (c.kind === "step" || c.kind === "leaf")
+            ? " is-path is-path-step"
+            : onPath
+              ? " is-path"
+              : hasSelection
+                ? " is-dim"
+                : "";
+      const showEdgeLabel = Boolean(c.edgeLabel) && (onPath || !hasSelection);
+      const label = showEdgeLabel
+        ? `<text class="fork-diag-edge-label${onPath ? " is-path" : ""}" x="${mid}" y="${(y1 + y2) / 2 - 4}" text-anchor="middle">${escapeHtml(c.edgeLabel)}</text>`
+        : "";
+      edges.push(
+        `<path class="fork-diag-edge${edgeKind}" d="M${x1},${y1} C${mid},${y1} ${mid},${y2} ${x2},${y2}" fill="none" />${label}`,
+      );
+    }
+  }
+
+  const nodeSvg = nodes
+    .map((n) => {
+      const onPath = selectedPath.has(n.id);
+      const active = n.kind === "leaf" && n.trialIndex === analyzeSession.selectedIndex;
+      const dim = hasSelection && !onPath ? " is-dim" : "";
+      const cls = `fork-diag-node fork-diag-${n.kind}${onPath ? " is-path" : ""}${active ? " is-active" : ""}${dim}${
+        n.result ? ` fork-diag-res-${n.result}` : ""
+      }`;
+      const title = escapeHtml(n.title || n.label);
+      if (n.kind === "leaf") {
+        return `<g class="${cls}">
+          <foreignObject x="${n.x}" y="${n.y}" width="${n.w}" height="${nodeH}">
+            <div xmlns="http://www.w3.org/1999/xhtml" class="fork-diag-fo">
+              <button type="button" class="trial-row trial-row-fork fork-diag-fo-btn${active ? " is-active" : ""}" data-trial="${n.trialIndex}" title="${title}">
+                <span class="trial-id">${escapeHtml(n.label)}</span>
+                <span class="trial-result trial-${n.result}">${escapeHtml(RESULT_LABEL[n.result] || n.result)}</span>
+                <span class="fork-diag-fo-sub">${escapeHtml(n.sub || "")}</span>
+              </button>
+            </div>
+          </foreignObject>
+        </g>`;
+      }
+      const badge =
+        onPath && n.kind === "fork"
+          ? `<text class="fork-diag-badge" x="${n.x + n.w - 4}" y="${n.y + 10}" text-anchor="end">叉</text>`
+          : onPath && n.kind === "step"
+            ? `<text class="fork-diag-badge fork-diag-badge-step" x="${n.x + n.w - 4}" y="${n.y + 10}" text-anchor="end">唯</text>`
+            : "";
+      return `<g class="${cls}">
+        <title>${title}</title>
+        <rect class="fork-diag-box" x="${n.x}" y="${n.y}" width="${n.w}" height="${nodeH}" rx="9" />
+        <text class="fork-diag-label" x="${n.x + n.w / 2}" y="${n.y + 16}" text-anchor="middle">${escapeHtml(n.label)}</text>
+        <text class="fork-diag-sub" x="${n.x + n.w / 2}" y="${n.y + 30}" text-anchor="middle">${escapeHtml(n.sub || "")}</text>
+        ${badge}
+      </g>`;
+    })
+    .join("");
+
+  const pathNote = hasSelection
+    ? `<span class="fork-diag-path-note">已选路径：<em class="c-step">绿=非分叉</em> · <em class="c-fork">橙=同分分叉</em></span>`
+    : `<span class="fork-diag-path-note">点击右侧叶子：高亮整条路径并区分分叉/非分叉</span>`;
+
+  return `<div class="fork-diag-wrap">
+    ${renderForkStripHtml(results)}
+    <div class="fork-diag-legend">
+      <span><i class="fork-leg fork-leg-root"></i>开局</span>
+      <span><i class="fork-leg fork-leg-step"></i>非分叉步（唯一最优）</span>
+      <span><i class="fork-leg fork-leg-branch"></i>同分分叉步</span>
+      <span><i class="fork-leg fork-leg-win"></i>通关</span>
+      <span><i class="fork-leg fork-leg-dead"></i>卡死/上限</span>
+      ${pathNote}
+    </div>
+    <div class="fork-diag-scroll">
+      <svg class="fork-diag-svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-label="逐步分叉树状图">
+        <g class="fork-diag-edges">${edges.join("")}</g>
+        <g class="fork-diag-nodes">${nodeSvg}</g>
+      </svg>
+    </div>
+  </div>`;
+}
+
 function renderTrialListOnly() {
   const listEl = document.getElementById("trialList");
   const pagerEl = document.getElementById("trialPager");
@@ -1413,20 +1832,36 @@ function renderTrialListOnly() {
   if (!listEl || !pagerEl) return;
 
   const rows = filteredTrials();
-  const pages = Math.max(1, Math.ceil(rows.length / TRIAL_PAGE_SIZE));
-  if (analyzeSession.page >= pages) analyzeSession.page = pages - 1;
-  if (analyzeSession.page < 0) analyzeSession.page = 0;
-
-  const start = analyzeSession.page * TRIAL_PAGE_SIZE;
-  const slice = rows.slice(start, start + TRIAL_PAGE_SIZE);
+  const fork = isForkReport();
 
   if (countEl) {
     const types = analyzeSession.report?.summary?.patternTypes;
-    countEl.textContent =
-      types != null
-        ? `共 ${rows.length} 局 · ${types} 种独立路径`
-        : `共 ${rows.length} 局`;
+    if (fork) {
+      const trunc = analyzeSession.report?.summary?.truncated ? " · 已截断" : "";
+      countEl.textContent = `共 ${rows.length} 条支路 · 缩略+树状图${trunc}`;
+    } else {
+      countEl.textContent =
+        types != null
+          ? `共 ${rows.length} 局 · ${types} 种独立路径`
+          : `共 ${rows.length} 局`;
+    }
   }
+
+  if (fork) {
+    listEl.classList.add("is-fork-tree");
+    listEl.innerHTML = rows.length
+      ? renderForkTreeHtml(rows)
+      : `<p class="trial-empty">当前筛选下无支路</p>`;
+    pagerEl.innerHTML = `<span class="fork-tree-pager-hint">上方缩略一眼看全支路；下方树含每步。绿=唯一最优，橙=分叉；点缩略行或叶子看 trace</span>`;
+    return;
+  }
+
+  listEl.classList.remove("is-fork-tree");
+  const pages = Math.max(1, Math.ceil(rows.length / TRIAL_PAGE_SIZE));
+  if (analyzeSession.page >= pages) analyzeSession.page = pages - 1;
+  if (analyzeSession.page < 0) analyzeSession.page = 0;
+  const start = analyzeSession.page * TRIAL_PAGE_SIZE;
+  const slice = rows.slice(start, start + TRIAL_PAGE_SIZE);
 
   listEl.innerHTML = slice
     .map((r) => {
@@ -1457,15 +1892,27 @@ function renderTrialListOnly() {
 function renderAnalyzeReport(report) {
   const s = report.summary;
   const p = report.profile;
+  const fork = isForkReport(report);
+  const sampleUnit = fork ? "支路" : "局";
   const buckets = report.progressBuckets
-    .map((b) => `<li><strong>${b.label}</strong>：${b.count} 局（${pct(b.rate)}）</li>`)
+    .map((b) => `<li><strong>${b.label}</strong>：${b.count} ${sampleUnit}（${pct(b.rate)}）</li>`)
     .join("");
+  const meta = fork
+    ? `贪心 · 单局分叉 · ${report.results?.length ?? 0}/${report.config.maxBranches ?? report.config.trials} 支路${
+        s.truncated ? "（已截断）" : ""
+      } · 宽≤${report.config.maxForkWidth ?? 8} · ${enabledOpsSummary(normalizeEnabledOps(report.config.enabledOps))}`
+    : `贪心 · ${report.config.trials} 局 · 仅移动 · ${enabledOpsSummary(normalizeEnabledOps(report.config.enabledOps))}`;
+  const rateNote = fork
+    ? `<p class="analyze-profile">分叉支路样本比例（非蒙特卡洛局数）${
+        s.truncated ? "；同分宽度或支路上限导致截断" : ""
+      }</p>`
+    : "";
 
   els.analyzeResult.innerHTML = `
     <div class="analyze-head">
       <strong>难度 ${s.difficulty}</strong>
       <span class="analyze-tier">${s.tier}</span>
-      <span class="analyze-meta">贪心 · ${report.config.trials} 局 · 仅移动 · ${enabledOpsSummary(normalizeEnabledOps(report.config.enabledOps))}</span>
+      <span class="analyze-meta">${meta}</span>
     </div>
     <ul class="analyze-stats">
       <li>通关率 <strong>${pct(s.winRate)}</strong></li>
@@ -1476,11 +1923,12 @@ function renderAnalyzeReport(report) {
         <li>通关中位步数 <strong>${s.p50WinMoves || "—"}</strong>（P90 ${s.p90WinMoves || "—"}，按实际移动）</li>
     </ul>
     <p class="analyze-profile">结构：${p.shelves} 架 / ${p.items} 物 / ${p.types} 种 / 深 ${p.maxDepth} / 特殊 ${p.specials}</p>
+    ${rateNote}
     <ul class="analyze-buckets">${buckets}</ul>
 
     <div class="trial-browser">
       <div class="trial-browser-head">
-        <strong>单局明细</strong>
+        <strong>${fork ? "支路明细" : "单局明细"}</strong>
         <span id="trialCount"></span>
       </div>
       <div class="trial-filters">
@@ -1513,6 +1961,7 @@ function renderTraceDetail(summary, traced) {
   if (!detailEl) return;
 
   const steps = traced.trace || [];
+  const forkPointSteps = new Set((summary.forkPoints || []).map((p) => p.step));
   analyzeSession.traceBoards = steps.map((step) => ({
     before: step.before,
     after: step.after,
@@ -1526,6 +1975,10 @@ function renderTraceDetail(summary, traced) {
         )
         .join("");
       const warn = step.wasPreferred ? "" : '<span class="trial-warn">非首选(避环)</span>';
+      const forkTag =
+        (step.forkWidth > 1 || forkPointSteps.has(step.step))
+          ? `<span class="trace-fork-tag">同分分叉 ×${step.forkWidth || summary.forkPoints?.find((p) => p.step === step.step)?.candidates || "?"}</span>`
+          : "";
       const atomicTag =
         step.atomicCount > 1
           ? `<span class="trace-atomic">实际 ${step.atomicCount} 手 · 累计移动 ${step.movesTotal}</span>`
@@ -1560,6 +2013,7 @@ function renderTraceDetail(summary, traced) {
             }${step.revealScarce ? "·稀缺" : ""}
           </span>
           ${atomicTag}
+          ${forkTag}
           ${warn}
         </summary>
         <div class="trace-body">
@@ -1573,21 +2027,34 @@ function renderTraceDetail(summary, traced) {
     })
     .join("");
 
+  const fork = summary.forkPath != null || isForkReport();
+  const deathLine =
+    fork && traced.result !== "win" && summary.deathStep != null
+      ? ` · 死于逻辑步 ${summary.deathStep}`
+      : fork && traced.result === "win"
+        ? " · 通关"
+        : "";
   detailEl.hidden = false;
   detailEl.innerHTML = `
     <div class="trial-detail-head">
-      <strong>局 #${summary.trialIndex}</strong>
+      <strong>${fork ? `支路 #${summary.branchId ?? summary.trialIndex}` : `局 #${summary.trialIndex}`}</strong>
       ${
-        summary.patternId != null
+        !fork && summary.patternId != null
           ? `<span class="trial-pattern">型${summary.patternId}${
               (summary.patternCount || 1) > 1 ? `×${summary.patternCount}` : ""
             }</span>`
           : ""
       }
       <span class="trial-result trial-${traced.result}">${RESULT_LABEL[traced.result]}</span>
-      <span>${traced.moves} 实际移动 · ${traced.logicSteps ?? traced.trace?.length ?? "—"} 逻辑步 · 进度 ${pct(traced.progress)} · seed ${traced.seed}</span>
+      <span>${traced.moves} 实际移动 · ${traced.logicSteps ?? traced.trace?.length ?? "—"} 逻辑步 · 进度 ${pct(traced.progress)}${
+        fork ? deathLine : ` · seed ${traced.seed}`
+      }</span>
     </div>
-    <p class="trial-detail-hint">「型N」按逐步着法路径指纹枚举，路径相同则共用同一型号。「暴露」为该步前后剩余暴露新层机会（⌊空位/3⌋+首层可消组数；≤2 且仍有下层时为稀缺）。展示按逻辑步；合成一步按实际移动手数累计。红=移出，绿=放入。可用「复制」导出前两层三维数组。</p>
+    ${
+      fork
+        ? `<p class="trial-detail-hint">路径：${escapeHtml(summary.forkPath || "主路")}。点击列表直接展示该支路已存 trace（非 seed 重跑）。「同分分叉 ×N」标出途经的最高分并列步。</p>`
+        : `<p class="trial-detail-hint">「型N」按逐步着法路径指纹枚举，路径相同则共用同一型号。「暴露」为该步前后剩余暴露新层机会（⌊空位/3⌋+首层可消组数；≤2 且仍有下层时为稀缺）。展示按逻辑步；合成一步按实际移动手数累计。红=移出，绿=放入。可用「复制」导出前两层三维数组。</p>`
+    }
     <div class="trace-list">${stepHtml || "<p>无步骤记录</p>"}</div>
   `;
   detailEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -1923,6 +2390,22 @@ async function openTrialTrace(trialIndex) {
   renderTrialListOnly();
 
   const detailEl = document.getElementById("trialDetail");
+  const fork = isForkReport() || Array.isArray(summary.trace);
+
+  // Fork leaves keep slim traces (actions only); hydrate boards on open — not seed re-playout.
+  if (fork && Array.isArray(summary.trace)) {
+    if (detailEl) {
+      detailEl.hidden = false;
+      detailEl.innerHTML = `<p>正在展开支路 #${summary.branchId ?? trialIndex}…</p>`;
+    }
+    await new Promise((r) => setTimeout(r, 10));
+    hydrateForkLeafTrace(analyzeSession.raw, summary, {
+      enabledOps: analyzeSession.report?.config?.enabledOps,
+    });
+    renderTraceDetail(summary, summary);
+    return;
+  }
+
   if (detailEl) {
     detailEl.hidden = false;
     detailEl.innerHTML = `<p>正在重放局 #${trialIndex} 的逐步过程…</p>`;
@@ -1949,6 +2432,8 @@ async function runDifficultyAnalysis() {
     return;
   }
 
+  syncAnalyzeModeUi();
+  const mode = readAnalyzeMode();
   const trials = readAnalyzeTrials();
   if (els.analyzeTrials) els.analyzeTrials.value = String(trials);
 
@@ -1963,6 +2448,7 @@ async function runDifficultyAnalysis() {
   });
   els.btnAnalyze.disabled = true;
   if (els.analyzeTrials) els.analyzeTrials.disabled = true;
+  if (els.analyzeMode) els.analyzeMode.disabled = true;
 
   await new Promise((r) => setTimeout(r, 30));
 
@@ -1970,7 +2456,10 @@ async function runDifficultyAnalysis() {
     const enabledOps = readEnabledOpsFromUi();
     saveEnabledOps(enabledOps);
     const report = await analyzeLevelOffMain(raw, {
+      mode,
       trials,
+      maxBranches: mode === "fork" ? trials : undefined,
+      maxForkWidth: 8,
       strategy: "greedy",
       maxMoves: 2500,
       seed: 42,
@@ -1982,15 +2471,26 @@ async function runDifficultyAnalysis() {
 
     if (!report?.results?.length) {
       // Fallback if an old worker still stripped results.
-      const full = await analyzeLevelAsync(raw, {
-        trials,
-        strategy: "greedy",
-        maxMoves: 2500,
-        seed: 42,
-        enabledOps,
-        chunkSize: trials > 2000 ? 20 : 4,
-        onProgress: renderAnalyzeProgress,
-      });
+      const { analyzeForkAsync } = await import("./analyze.js?v=20260802k");
+      const full =
+        mode === "fork"
+          ? await analyzeForkAsync(raw, {
+              maxBranches: trials,
+              maxForkWidth: 8,
+              maxMoves: 2500,
+              seed: 42,
+              enabledOps,
+              onProgress: renderAnalyzeProgress,
+            })
+          : await analyzeLevelAsync(raw, {
+              trials,
+              strategy: "greedy",
+              maxMoves: 2500,
+              seed: 42,
+              enabledOps,
+              chunkSize: trials > 2000 ? 20 : 4,
+              onProgress: renderAnalyzeProgress,
+            });
       analyzeSession.raw = raw;
       analyzeSession.report = full;
       analyzeSession.filter = "all";
@@ -2013,6 +2513,7 @@ async function runDifficultyAnalysis() {
   } finally {
     els.btnAnalyze.disabled = false;
     if (els.analyzeTrials) els.analyzeTrials.disabled = false;
+    if (els.analyzeMode) els.analyzeMode.disabled = false;
   }
 }
 
@@ -2030,8 +2531,29 @@ els.analyzeResult?.addEventListener("change", (event) => {
   }
 });
 
+/** Walk ancestors (SVG-safe): find element carrying data-trial. */
+function findTrialClickTarget(start) {
+  let el = start;
+  if (el && el.nodeType === Node.TEXT_NODE) el = el.parentElement;
+  while (el && el !== els.analyzeResult) {
+    if (typeof el.getAttribute === "function") {
+      const raw = el.getAttribute("data-trial");
+      if (raw != null && raw !== "") {
+        const isRow =
+          el.classList?.contains("trial-row") || el.classList?.contains("fork-diag-node");
+        if (isRow || el.tagName === "BUTTON") {
+          const trialIndex = Number(raw);
+          if (Number.isFinite(trialIndex)) return { el, trialIndex };
+        }
+      }
+    }
+    el = el.parentElement;
+  }
+  return null;
+}
+
 els.analyzeResult?.addEventListener("click", (event) => {
-  const copyBtn = event.target.closest(".mini-copy-btn");
+  const copyBtn = event.target.closest?.(".mini-copy-btn");
   if (copyBtn) {
     event.preventDefault();
     event.stopPropagation();
@@ -2043,16 +2565,16 @@ els.analyzeResult?.addEventListener("click", (event) => {
     return;
   }
 
-  const pageBtn = event.target.closest(".trial-page-btn");
+  const pageBtn = event.target.closest?.(".trial-page-btn");
   if (pageBtn) {
     analyzeSession.page += Number(pageBtn.dataset.dir);
     renderTrialListOnly();
     return;
   }
 
-  const row = event.target.closest(".trial-row");
-  if (row) {
-    openTrialTrace(Number(row.dataset.trial)).catch((err) => {
+  const hit = findTrialClickTarget(event.target);
+  if (hit) {
+    openTrialTrace(hit.trialIndex).catch((err) => {
       setLevelError(err.message || String(err));
     });
   }
@@ -2063,19 +2585,33 @@ els.btnAnalyze.addEventListener("click", () => {
   runDifficultyAnalysis().catch((err) => {
     setLevelError(err.message || String(err));
     els.btnAnalyze.disabled = false;
+    if (els.analyzeMode) els.analyzeMode.disabled = false;
   });
 });
 els.btnLoadLevel.addEventListener("click", () => loadFromInput({ autoStart: true }));
+els.analyzeMode?.addEventListener("change", () => {
+  syncAnalyzeModeUi();
+  if (readAnalyzeMode() === "fork" && Number(els.analyzeTrials?.value) === 120) {
+    els.analyzeTrials.value = "64";
+  }
+});
 
 els.btnSimOpsAll?.addEventListener("click", () => setAllSimOps(true));
 els.btnSimOpsNone?.addEventListener("click", () => setAllSimOps(false));
+document.getElementById("simOpsPresets")?.addEventListener("click", (event) => {
+  const btn = event.target.closest?.("[data-ops-preset]");
+  if (!btn) return;
+  applySimOpsPreset(btn.dataset.opsPreset);
+});
 els.simOpsList?.addEventListener("change", (event) => {
   if (event.target?.matches?.("input[data-sim-op]")) {
     saveEnabledOps(readEnabledOpsFromUi());
+    syncSimOpsPresetButtons();
   }
 });
 
 renderSimOpsPanel();
+syncAnalyzeModeUi();
 fillSample();
 
 try {
