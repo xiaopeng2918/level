@@ -164,6 +164,117 @@ export function normalizeEnabledOps(input) {
   return base;
 }
 
+/**
+ * Skill buckets from presets:
+ * - easy: ops in 简单
+ * - normalExtra: ops in 普通 but not 简单 (翻层可消)
+ * - hardExtra: ops in 困难 but not 普通 (选架翻层)
+ */
+let _opSkillSets = null;
+export function getOpSkillSets() {
+  if (_opSkillSets) return _opSkillSets;
+  const e = SIM_OP_PRESETS.easy.ops;
+  const n = SIM_OP_PRESETS.normal.ops;
+  const h = SIM_OP_PRESETS.hard.ops;
+  const easy = new Set();
+  const normalExtra = new Set();
+  const hardExtra = new Set();
+  for (const { id } of SIM_OP_DEFS) {
+    if (e[id]) easy.add(id);
+    if (n[id] && !e[id]) normalExtra.add(id);
+    if (h[id] && !n[id]) hardExtra.add(id);
+  }
+  _opSkillSets = { easy, normalExtra, hardExtra };
+  return _opSkillSets;
+}
+
+/**
+ * Skill bucket for one logic step.
+ * setupReveal / digMatch are often modifiers on match3/setup3/dig* reasons —
+ * so also inspect score `parts` (e.g. `选架#…`, `翻层可消…`).
+ * Priority: hardExtra > normalExtra > easy.
+ *
+ * Note: scarce boards also emit `选架#` score parts for tie-breaking even when
+ * the 选架翻层 op is off — those must NOT count as hardExtra unless setupReveal
+ * is actually enabled.
+ * @returns {"easy"|"normalExtra"|"hardExtra"|null}
+ */
+export function classifyOpSkill(reason, parts = null, enabledOps = null) {
+  if (!reason || reason === "random" || reason === "fallback") return null;
+  const ps = Array.isArray(parts) ? parts : [];
+  const hasPart = (prefix) =>
+    ps.some((p) => typeof p === "string" && p.startsWith(prefix));
+  const setupRevealOn = Boolean(enabledOps && enabledOps.setupReveal);
+
+  // 困难多出 = 真正开了「选架翻层」且本步用到了其得分/原因。
+  // （稀缺时凑三也会写 选架# 仅作打分，未开开关不算困难）
+  if (setupRevealOn && (reason === "setupReveal" || hasPart("选架#"))) {
+    return "hardExtra";
+  }
+
+  // 普通多出 = 本步主操作就是「翻层可消」(reason=digMatch)。
+  // 勿用 parts 里的「顺带翻层可消」：那是凑三/翻层后的附带加分，步骤仍是简单档操作。
+  if (reason === "digMatch") return "normalExtra";
+
+  const sets = getOpSkillSets();
+  if (setupRevealOn && sets.hardExtra.has(reason)) return "hardExtra";
+  if (sets.normalExtra.has(reason)) return "normalExtra";
+  if (sets.easy.has(reason)) return "easy";
+  // Unknown sim reasons still count as base skill.
+  return "easy";
+}
+
+function pct1(n, total) {
+  if (!total) return 0;
+  return Math.round((n / total) * 1000) / 10;
+}
+
+/** Logic-step op mix from a slim/full trace (uses reason + parts, not atomic hands). */
+export function summarizeOpSkillMix(trace, enabledOps = null) {
+  let easy = 0;
+  let normalExtra = 0;
+  let hardExtra = 0;
+  for (const step of trace || []) {
+    const bucket = classifyOpSkill(step?.reason, step?.parts, enabledOps);
+    if (bucket === "easy") easy += 1;
+    else if (bucket === "normalExtra") normalExtra += 1;
+    else if (bucket === "hardExtra") hardExtra += 1;
+  }
+  const total = easy + normalExtra + hardExtra;
+  return {
+    total,
+    easyCount: easy,
+    normalExtraCount: normalExtra,
+    hardExtraCount: hardExtra,
+    easyPct: pct1(easy, total),
+    normalExtraPct: pct1(normalExtra, total),
+    hardExtraPct: pct1(hardExtra, total),
+  };
+}
+
+/** Aggregate mixes (e.g. all winning leaves). */
+export function aggregateOpSkillMix(mixes) {
+  let easy = 0;
+  let normalExtra = 0;
+  let hardExtra = 0;
+  for (const m of mixes || []) {
+    if (!m) continue;
+    easy += m.easyCount || 0;
+    normalExtra += m.normalExtraCount || 0;
+    hardExtra += m.hardExtraCount || 0;
+  }
+  const total = easy + normalExtra + hardExtra;
+  return {
+    total,
+    easyCount: easy,
+    normalExtraCount: normalExtra,
+    hardExtraCount: hardExtra,
+    easyPct: pct1(easy, total),
+    normalExtraPct: pct1(normalExtra, total),
+    hardExtraPct: pct1(hardExtra, total),
+  };
+}
+
 function isOpEnabled(enabledOps, reason) {
   if (reason === "random" || reason === "fallback") return true;
   // setupReveal is a modifier, not a standalone move reason.
@@ -453,9 +564,13 @@ function findFrontMatchPlans(
       return out;
     }
 
-    function dfs(state, path, preferShelf = -1, localCap = planCap) {
+    /**
+     * Depth-limited DFS. Shorter clears must be searched first — a deep dive on the
+     * first root move used to fill planCap with 3–6手 plans and miss 2手 swaps.
+     */
+    function dfs(state, path, preferShelf, localCap, maxDepth) {
       if (plans.length >= localCap) return;
-      if (path.length >= effectiveMax) return;
+      if (path.length >= maxDepth) return;
       const depth = path.length;
       const ranked = listActions(state)
         .map((a) => ({
@@ -491,7 +606,15 @@ function findFrontMatchPlans(
           }
           continue;
         }
-        if (newPath.length < effectiveMax) dfs(next, newPath, preferShelf, localCap);
+        if (newPath.length < maxDepth) dfs(next, newPath, preferShelf, localCap, maxDepth);
+      }
+    }
+
+    function searchUpTo(preferShelf, localCap) {
+      // Iterative deepening: find 2手 before 3手… so min-hands pickFrom is honest.
+      for (let maxDepth = 2; maxDepth <= effectiveMax; maxDepth += 1) {
+        if (plans.length >= localCap) return;
+        dfs(shelves, [], preferShelf, localCap, maxDepth);
       }
     }
 
@@ -502,10 +625,10 @@ function findFrontMatchPlans(
       for (const row of seeds) {
         if (plans.length >= planCap) break;
         const seedCap = Math.min(planCap, plans.length + perSeed);
-        dfs(shelves, [], row.shelf, seedCap);
+        searchUpTo(row.shelf, seedCap);
       }
     }
-    dfs(shelves, [], -1, planCap);
+    searchUpTo(-1, planCap);
 
     if (cacheKey) {
       searchCache.set(cacheKey, plans.map(copySetupPlan));
@@ -1790,9 +1913,10 @@ function tryApplyForkAction(node, action, detail, ranked, _revealBefore, candida
   return next;
 }
 
-function finishForkLeaf(node, result, itemsStart, branchId) {
+function finishForkLeaf(node, result, itemsStart, branchId, enabledOps = null) {
   const left = result === "win" ? 0 : countItems(node.shelves);
   const progress = result === "win" ? 1 : itemsStart ? (itemsStart - left) / itemsStart : 0;
+  const opMix = summarizeOpSkillMix(node.trace, enabledOps);
   return {
     result,
     moves: node.moves,
@@ -1813,6 +1937,7 @@ function finishForkLeaf(node, result, itemsStart, branchId) {
     truncatedAt: node.truncatedAt,
     trace: node.trace,
     slimTrace: true,
+    opMix,
   };
 }
 
@@ -1895,20 +2020,20 @@ export function analyzeForkTree(rawLevel, options = {}) {
   while (frontier.length && leaves.length < maxBranches) {
     const node = frontier.shift();
     if (isWon(node.shelves)) {
-      leaves.push(finishForkLeaf(node, "win", itemsStart, leaves.length));
+      leaves.push(finishForkLeaf(node, "win", itemsStart, leaves.length, enabledOps));
       continue;
     }
     const actions = listActions(node.shelves);
     if (isBoardFailed(node.shelves) || actions.length === 0) {
-      leaves.push(finishForkLeaf(node, "deadlock", itemsStart, leaves.length));
+      leaves.push(finishForkLeaf(node, "deadlock", itemsStart, leaves.length, enabledOps));
       continue;
     }
     if (node.moves >= maxMoves) {
-      leaves.push(finishForkLeaf(node, "limit", itemsStart, leaves.length));
+      leaves.push(finishForkLeaf(node, "limit", itemsStart, leaves.length, enabledOps));
       continue;
     }
     if (node.loops >= 80 || node.stallSteps >= 250) {
-      leaves.push(finishForkLeaf(node, "deadlock", itemsStart, leaves.length));
+      leaves.push(finishForkLeaf(node, "deadlock", itemsStart, leaves.length, enabledOps));
       continue;
     }
 
@@ -1928,7 +2053,7 @@ export function analyzeForkTree(rawLevel, options = {}) {
         : [];
 
     if (!pickFrom.length) {
-      leaves.push(finishForkLeaf(node, "deadlock", itemsStart, leaves.length));
+      leaves.push(finishForkLeaf(node, "deadlock", itemsStart, leaves.length, enabledOps));
       continue;
     }
 
@@ -2001,7 +2126,7 @@ export function analyzeForkTree(rawLevel, options = {}) {
         }
       }
       if (rescued) frontier.push(rescued);
-      else leaves.push(finishForkLeaf(node, "deadlock", itemsStart, leaves.length));
+      else leaves.push(finishForkLeaf(node, "deadlock", itemsStart, leaves.length, enabledOps));
       continue;
     }
 
@@ -2027,7 +2152,7 @@ export function analyzeForkTree(rawLevel, options = {}) {
     truncated = true;
     const result =
       isWon(node.shelves) ? "win" : node.moves >= maxMoves ? "limit" : "deadlock";
-    leaves.push(finishForkLeaf(node, result, itemsStart, leaves.length));
+    leaves.push(finishForkLeaf(node, result, itemsStart, leaves.length, enabledOps));
   }
   if (frontier.length) truncated = true;
 
@@ -2105,6 +2230,12 @@ export async function analyzeForkAsync(rawLevel, options = {}) {
   });
   report.summary.forkMode = true;
   report.summary.truncated = tree.truncated;
+  const winMixes = (tree.results || [])
+    .filter((r) => r.result === "win")
+    .map((r) => r.opMix);
+  report.summary.winOpMix = aggregateOpSkillMix(winMixes);
+  report.summary.winOpMixNote =
+    "胜利支路逻辑步中：简单=简单档操作；普通=相对简单多出（翻层可消）；困难=相对普通多出（选架翻层）";
   return report;
 }
 

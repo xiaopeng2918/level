@@ -2,12 +2,14 @@ import {
   analyzeLevelAsync,
   playout,
   hydrateForkLeafTrace,
+  classifyOpSkill,
+  summarizeOpSkillMix,
   SIM_OP_DEFS,
   SIM_OP_PRESETS,
   defaultEnabledOps,
   normalizeEnabledOps,
-} from "./analyze.js?v=20260802p";
-import { analyzeLevelOffMain } from "./analyze-client.js?v=20260802p";
+} from "./analyze.js?v=20260803c";
+import { analyzeLevelOffMain } from "./analyze-client.js?v=20260803c";
 
 const TRIPLE_WIDTH = 3;
 const SINGLE_WIDTH = 1;
@@ -1675,9 +1677,38 @@ function layoutForkDiagram(rootDiag, selectedTrialIndex) {
   return { nodes: all, width, height, selectedPath, nodeH: NODE_H };
 }
 
+const SKILL_STRIP = {
+  easy: { cls: "skill-easy", label: "简单" },
+  normalExtra: { cls: "skill-normal", label: "普通" },
+  hardExtra: { cls: "skill-hard", label: "困难" },
+};
+
+/** One cell per logic step for the open branch (aligned with the step list). */
+function renderBranchSkillStripHtml(steps, enabledOps) {
+  const list = steps || [];
+  if (!list.length) return "";
+  const cells = list
+    .map((step) => {
+      const isFork = step.forkWidth != null && step.forkWidth > 1;
+      const skill = classifyOpSkill(step.reason, step.parts, enabledOps);
+      const skillMeta = SKILL_STRIP[skill] || { cls: "skill-other", label: "其它" };
+      const reasonLabel = REASON_LABEL[step.reason] || step.reason || "";
+      const tip = `L${step.step} ${skillMeta.label} · ${reasonLabel}`;
+      return `<span class="fork-strip-cell branch-strip-cell ${skillMeta.cls}${
+        isFork ? " is-fork" : ""
+      }" title="${escapeHtml(tip)}"></span>`;
+    })
+    .join("");
+  return `<div class="branch-skill-strip" title="与下方步骤一一对应">
+    <span class="branch-skill-strip-label">本支路</span>
+    <span class="branch-skill-strip-track">${cells}</span>
+    <span class="branch-skill-strip-legend"><em class="c-easy">简单</em> <em class="c-normal">普通</em> <em class="c-hard">困难</em></span>
+  </div>`;
+}
+
 /**
  * Minimal strip overview: one row per branch, cells = logic steps.
- * Green = unique best, orange = fork; click row opens that branch.
+ * Fill = 简单/普通/困难；描边加粗 = 同分分叉。点击行打开该支路。
  */
 function renderForkStripHtml(results) {
   const sorted = [...results].sort(
@@ -1685,6 +1716,7 @@ function renderForkStripHtml(results) {
   );
   const maxSteps = Math.max(1, ...sorted.map((r) => (r.trace || []).length));
   const selected = analyzeSession.selectedIndex;
+  const enabledOps = normalizeEnabledOps(analyzeSession.report?.config?.enabledOps);
 
   const rows = sorted
     .map((r) => {
@@ -1697,17 +1729,20 @@ function renderForkStripHtml(results) {
           const isFork =
             forkByStep.has(step.step) || (step.forkWidth != null && step.forkWidth > 1);
           const fp = forkByStep.get(step.step);
+          const skill = classifyOpSkill(step.reason, step.parts, enabledOps);
+          const skillMeta = SKILL_STRIP[skill] || { cls: "skill-other", label: "其它" };
+          const reasonLabel = REASON_LABEL[step.reason] || step.reason || "";
           const tip = isFork
-            ? `L${step.step} 同分分叉×${fp?.candidates || step.forkWidth || "?"}${
+            ? `L${step.step} ${skillMeta.label} · 同分分叉×${fp?.candidates || step.forkWidth || "?"}${
                 fp != null ? ` #${(fp.chosenIndex ?? 0) + 1}/${fp.candidates}` : ""
-              }`
-            : `L${step.step} 唯一最优 · ${REASON_LABEL[step.reason] || step.reason || ""}`;
-          return `<i class="fork-strip-cell${isFork ? " is-fork" : " is-step"}" title="${escapeHtml(tip)}"></i>`;
+              } · ${reasonLabel}`
+            : `L${step.step} ${skillMeta.label} · ${reasonLabel}`;
+          return `<span class="fork-strip-cell ${skillMeta.cls}${isFork ? " is-fork" : ""}" title="${escapeHtml(tip)}"></span>`;
         })
         .join("");
       const pad =
         steps.length < maxSteps
-          ? `<i class="fork-strip-pad" style="flex:${maxSteps - steps.length}"></i>`
+          ? `<span class="fork-strip-pad" style="flex:${maxSteps - steps.length}"></span>`
           : "";
       return `<button type="button" class="fork-strip-row trial-row${active}" data-trial="${r.trialIndex}" title="${escapeHtml(fullPath)}">
         <span class="fork-strip-id">#${r.branchId ?? r.trialIndex}</span>
@@ -1720,7 +1755,7 @@ function renderForkStripHtml(results) {
   return `<div class="fork-strip-wrap">
     <div class="fork-strip-head">
       <strong>支路缩略</strong>
-      <span>一行一支路 · 横轴逻辑步 · <em class="c-step">绿非分叉</em> / <em class="c-fork">橙分叉</em> · 点击行查看</span>
+      <span>一行一支路 · <em class="c-easy">简单</em> / <em class="c-normal">普通</em> / <em class="c-hard">困难</em> · <em class="c-fork">粗边=分叉</em> · 点击行查看</span>
     </div>
     <div class="fork-strip-scroll">${rows}</div>
   </div>`;
@@ -1852,7 +1887,7 @@ function renderTrialListOnly() {
     listEl.innerHTML = rows.length
       ? renderForkTreeHtml(rows)
       : `<p class="trial-empty">当前筛选下无支路</p>`;
-    pagerEl.innerHTML = `<span class="fork-tree-pager-hint">上方缩略一眼看全支路；下方树含每步。绿=唯一最优，橙=分叉；点缩略行或叶子看 trace</span>`;
+    pagerEl.innerHTML = `<span class="fork-tree-pager-hint">上方缩略：青绿=简单 · 琥珀=普通 · 红=困难 · 粗边=分叉；下方树：绿=唯一最优 · 橙=分叉。点缩略行或叶子看 trace</span>`;
     return;
   }
 
@@ -1921,6 +1956,11 @@ function renderAnalyzeReport(report) {
       <li>卡死时平均进度 <strong>${pct(s.avgDeadlockProgress)}</strong></li>
       <li>半程前卡死 <strong>${pct(s.earlyStuckRate)}</strong></li>
         <li>通关中位步数 <strong>${s.p50WinMoves || "—"}</strong>（P90 ${s.p90WinMoves || "—"}，按实际移动）</li>
+      ${
+        fork && s.winOpMix && s.winOpMix.total
+          ? `<li title="${escapeHtml(s.winOpMixNote || "")}">胜利支路操作占比 · 简单 <strong>${s.winOpMix.easyPct}%</strong> · 普通多出 <strong>${s.winOpMix.normalExtraPct}%</strong> · 困难多出 <strong>${s.winOpMix.hardExtraPct}%</strong>（共 ${s.winOpMix.total} 步）</li>`
+          : ""
+      }
     </ul>
     <p class="analyze-profile">结构：${p.shelves} 架 / ${p.items} 物 / ${p.types} 种 / 深 ${p.maxDepth} / 特殊 ${p.specials}</p>
     ${rateNote}
@@ -1961,6 +2001,7 @@ function renderTraceDetail(summary, traced) {
   if (!detailEl) return;
 
   const steps = traced.trace || [];
+  const enabledOps = normalizeEnabledOps(analyzeSession.report?.config?.enabledOps);
   const forkPointSteps = new Set((summary.forkPoints || []).map((p) => p.step));
   analyzeSession.traceBoards = steps.map((step) => ({
     before: step.before,
@@ -1979,6 +2020,9 @@ function renderTraceDetail(summary, traced) {
         (step.forkWidth > 1 || forkPointSteps.has(step.step))
           ? `<span class="trace-fork-tag">同分分叉 ×${step.forkWidth || summary.forkPoints?.find((p) => p.step === step.step)?.candidates || "?"}</span>`
           : "";
+      const skill = classifyOpSkill(step.reason, step.parts, enabledOps);
+      const skillMeta = SKILL_STRIP[skill] || { cls: "skill-other", label: "其它" };
+      const skillTag = `<span class="trace-skill ${skillMeta.cls}">${skillMeta.label}</span>`;
       const atomicTag =
         step.atomicCount > 1
           ? `<span class="trace-atomic">实际 ${step.atomicCount} 手 · 累计移动 ${step.movesTotal}</span>`
@@ -1993,6 +2037,7 @@ function renderTraceDetail(summary, traced) {
       return `<details class="trace-step">
         <summary>
           <span>#${step.step}</span>
+          ${skillTag}
           <span class="trace-reason">${REASON_LABEL[step.reason] || step.reason}</span>
           <span>分 ${step.score}</span>
           <span>${
@@ -2055,14 +2100,30 @@ function renderTraceDetail(summary, traced) {
         ? `<p class="trial-detail-hint">路径：${escapeHtml(summary.forkPath || "主路")}。点击列表直接展示该支路已存 trace（非 seed 重跑）。「同分分叉 ×N」标出途经的最高分并列步。</p>`
         : `<p class="trial-detail-hint">「型N」按逐步着法路径指纹枚举，路径相同则共用同一型号。「暴露」为该步前后剩余暴露新层机会（⌊空位/3⌋+首层可消组数；≤2 且仍有下层时为稀缺）。展示按逻辑步；合成一步按实际移动手数累计。红=移出，绿=放入。可用「复制」导出前两层三维数组。</p>`
     }
+    ${
+      fork && summary.opMix && summary.opMix.total
+        ? `<p class="trial-detail-hint">本支路操作占比（逻辑步）：简单 <strong>${summary.opMix.easyPct}%</strong>（${summary.opMix.easyCount}）· 普通多出 <strong>${summary.opMix.normalExtraPct}%</strong>（${summary.opMix.normalExtraCount}）· 困难多出 <strong>${summary.opMix.hardExtraPct}%</strong>（${summary.opMix.hardExtraCount}）</p>`
+        : ""
+    }
+    ${fork ? renderBranchSkillStripHtml(steps, enabledOps) : ""}
     <div class="trace-list">${stepHtml || "<p>无步骤记录</p>"}</div>
   `;
   detailEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
-function renderTraceCell(id, mark) {
-  const handMatch = typeof mark === "string" ? mark.match(/is-hand-(\d+)/) : null;
-  const badge = handMatch ? `<span class="mini-hand" title="第 ${handMatch[1]} 手">${handMatch[1]}</span>` : "";
+function renderTraceCell(id, mark, phase = "before") {
+  // 手数角标只标在「移动前」：起点红、落点绿，同一手同一数字。移动后不标数字。
+  let badge = "";
+  if (phase === "before" && typeof mark === "string") {
+    const handMatch = mark.match(/is-hand-(\d+)/);
+    if (handMatch) {
+      const role =
+        mark.includes("is-dst-target") || mark.includes("is-dst")
+          ? "mini-hand-dst"
+          : "mini-hand-src";
+      badge = `<span class="mini-hand ${role}" title="第 ${handMatch[1]} 手">${handMatch[1]}</span>`;
+    }
+  }
   if (!id) {
     return `<span class="mini-cell empty${mark ? ` ${mark}` : ""}">${badge}</span>`;
   }
@@ -2136,21 +2197,28 @@ function cellMark(hl, phase, shelfIndex, slotIndex, cellId) {
 
   const highlight = hl.highlight;
   if (!highlight) return "";
+  // 单手与多手计划一致：前后用同一手数编号（固定为 1）。
   if (highlight.type === "special") {
     if (highlight.shelf === shelfIndex && highlight.slot === slotIndex) {
-      return phase === "before" ? "is-src" : "is-gone";
+      return phase === "before" ? "is-src is-hand-1" : "is-gone is-hand-1";
     }
     return "";
   }
-  if (phase === "before" && highlight.fromShelf === shelfIndex && highlight.fromSlot === slotIndex) {
-    return "is-src";
+  if (phase === "before") {
+    if (highlight.fromShelf === shelfIndex && highlight.fromSlot === slotIndex) {
+      return "is-src is-hand-1";
+    }
+    if (highlight.toShelf === shelfIndex && highlight.toSlot === slotIndex) {
+      return "is-dst-target is-hand-1";
+    }
+    return "";
   }
   if (phase === "after" && highlight.toShelf === shelfIndex && highlight.toSlot === slotIndex) {
-    if (cellId === highlight.id) return "is-dst";
-    return "is-resolved";
+    if (cellId === highlight.id) return "is-dst is-hand-1";
+    return "is-resolved is-hand-1";
   }
   if (phase === "after" && highlight.fromShelf === shelfIndex && highlight.fromSlot === slotIndex) {
-    return "is-vacated";
+    return "is-vacated is-hand-1";
   }
   return "";
 }
@@ -2186,12 +2254,14 @@ function renderMiniBoard(board, hl, phase) {
         : '<span class="mini-behind is-last">末层</span>';
 
       const frontCells = front
-        .map((id, slot) => renderTraceCell(id, cellMark(hl, phase, shelf.i, slot, id)))
+        .map((id, slot) =>
+          renderTraceCell(id, cellMark(hl, phase, shelf.i, slot, id), phase),
+        )
         .join("");
 
       const peekRow = hasNext
         ? `<div class="mini-row mini-peek" title="剩余 ${layerCount} 层">${nextLayer
-            .map((id) => renderTraceCell(id, "is-peek"))
+            .map((id) => renderTraceCell(id, "is-peek", phase))
             .join("")}</div>`
         : "";
 
@@ -2272,21 +2342,10 @@ function renderMoveCaption(hl, step) {
       const ids = canClear
         ? step.action.matchIds.join(",")
         : (step.action.revealTypes || []).join(",") || "?";
-      return `<div class="move-caption">
-      <span>${canClear ? "翻层可消" : "多步翻层"}</span>
-      <span>${canClear ? `可消 id${ids}` : `露出 id${ids}`}</span>
-      <span class="move-arrow">×${step.atomicCount} 手</span>
-      <span class="move-note">合成 1 逻辑步</span>
-      <span class="move-hands">${hands}</span>
-    </div>`;
+      const head = canClear ? `翻层可消 id${ids}` : `多步翻层 露出id${ids}`;
+      return `<div class="move-caption">${head} · ×${step.atomicCount}手 · 合成1逻辑步 · ${hands}</div>`;
     }
-    return `<div class="move-caption">
-      <span>首层多步凑三</span>
-      <span>消除 id${step.action.matchType}</span>
-      <span class="move-arrow">×${step.atomicCount} 手</span>
-      <span class="move-note">合成 1 逻辑步</span>
-      <span class="move-hands">${hands}</span>
-    </div>`;
+    return `<div class="move-caption">首层多步凑三 · 消除 id${step.action.matchType} · ×${step.atomicCount}手 · 合成1逻辑步 · ${hands}</div>`;
   }
   const highlight = hl?.highlight;
   if (!highlight) return "";
@@ -2301,15 +2360,7 @@ function renderMoveCaption(hl, step) {
       const cell = shelf?.front?.[highlight.toSlot];
       return cell !== highlight.id;
     })();
-  return `<div class="move-caption">
-    <span class="move-chip" style="--item-color:${visual.color}">
-      <span>${visual.emoji}</span><span>${visual.label}</span>
-    </span>
-    <span>架${highlight.fromShelf}·格${highlight.fromSlot}</span>
-    <span class="move-arrow">→</span>
-    <span>架${highlight.toShelf}·格${highlight.toSlot}</span>
-    ${cleared ? '<span class="move-note">落入后消除/翻层</span>' : ""}
-  </div>`;
+  return `<div class="move-caption"><span class="move-chip" style="--item-color:${visual.color}"><span>${visual.emoji}</span><span>${visual.label}</span></span> 架${highlight.fromShelf}·格${highlight.fromSlot} → 架${highlight.toShelf}·格${highlight.toSlot}${cleared ? " · 落入后消除/翻层" : ""}</div>`;
 }
 
 /**
@@ -2402,6 +2453,11 @@ async function openTrialTrace(trialIndex) {
     hydrateForkLeafTrace(analyzeSession.raw, summary, {
       enabledOps: analyzeSession.report?.config?.enabledOps,
     });
+    // Recompute mix with current classifier (matches strip / step tags).
+    summary.opMix = summarizeOpSkillMix(
+      summary.trace,
+      normalizeEnabledOps(analyzeSession.report?.config?.enabledOps),
+    );
     renderTraceDetail(summary, summary);
     return;
   }
@@ -2471,7 +2527,7 @@ async function runDifficultyAnalysis() {
 
     if (!report?.results?.length) {
       // Fallback if an old worker still stripped results.
-      const { analyzeForkAsync } = await import("./analyze.js?v=20260802p");
+      const { analyzeForkAsync } = await import("./analyze.js?v=20260803c");
       const full =
         mode === "fork"
           ? await analyzeForkAsync(raw, {

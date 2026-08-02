@@ -9,8 +9,9 @@ import {
   defaultEnabledOps,
   normalizeEnabledOps,
   SIM_OP_PRESETS,
-} from "./analyze.js?v=20260802p";
-import { analyzeLevelOffMain, terminateAnalyzeWorker } from "./analyze-client.js?v=20260802p";
+  aggregateOpSkillMix,
+} from "./analyze.js?v=20260803c";
+import { analyzeLevelOffMain, terminateAnalyzeWorker } from "./analyze-client.js?v=20260803c";
 
 function readEnabledOpsFromUi() {
   const ops = defaultEnabledOps();
@@ -44,6 +45,24 @@ const FORK_TIER_FIELDS = FORK_TIER_DEFS.flatMap((tier) => [
     key: `${tier.prefix}WinRate`,
     zh: `${tier.zh}通关率`,
     en: `${tier.prefix}WinRate`,
+    type: "number",
+  },
+  {
+    key: `${tier.prefix}WinEasyOpPct`,
+    zh: `${tier.zh}胜局简单操作%`,
+    en: `${tier.prefix}WinEasyOpPct`,
+    type: "number",
+  },
+  {
+    key: `${tier.prefix}WinNormalOpPct`,
+    zh: `${tier.zh}胜局普通多出%`,
+    en: `${tier.prefix}WinNormalOpPct`,
+    type: "number",
+  },
+  {
+    key: `${tier.prefix}WinHardOpPct`,
+    zh: `${tier.zh}胜局困难多出%`,
+    en: `${tier.prefix}WinHardOpPct`,
     type: "number",
   },
 ]);
@@ -106,7 +125,7 @@ function syncBatchModeUi() {
     if (trials && (Number(trials.value) === 20 || !trials.value)) trials.value = "64";
     if (hint) {
       hint.textContent =
-        "拖入 Excel（含「物品数据 / itemData」）。三档分叉：简单 / 普通 / 困难各跑 N 条支路，每行额外写回 9 列（胜利次数、失败次数、通关率 × 3 档）。";
+        "拖入 Excel（含「物品数据 / itemData」）。三档分叉：简单 / 普通 / 困难各跑 N 条支路；每档写回胜利/失败/通关率，以及胜局中简单操作、普通多出（翻层可消）、困难多出（选架翻层）占比。";
     }
   } else {
     if (label) label.textContent = "每关局数";
@@ -344,16 +363,23 @@ function metricsFromReport(report) {
   return out;
 }
 
-/** Count win/fail/rate from a fork (or MC) report's leaf/trial rows. */
+/** Count win/fail/rate + win-path op skill mix from fork leaves. */
 function forkLeafCounts(report) {
   const results = report?.results || [];
   const total = results.length;
-  const wins = results.filter((r) => r.result === "win").length;
+  const winLeaves = results.filter((r) => r.result === "win");
+  const wins = winLeaves.length;
   const fails = total - wins;
+  const winOpMix =
+    report?.summary?.winOpMix ||
+    aggregateOpSkillMix(winLeaves.map((r) => r.opMix));
   return {
     winCount: wins,
     failCount: fails,
     winRate: pctNum(total ? wins / total : 0),
+    winEasyOpPct: winOpMix.total ? winOpMix.easyPct : "",
+    winNormalOpPct: winOpMix.total ? winOpMix.normalExtraPct : "",
+    winHardOpPct: winOpMix.total ? winOpMix.hardExtraPct : "",
   };
 }
 
@@ -633,6 +659,9 @@ async function runBatch() {
           metrics[`${tier.prefix}WinCount`] = counts.winCount;
           metrics[`${tier.prefix}FailCount`] = counts.failCount;
           metrics[`${tier.prefix}WinRate`] = counts.winRate;
+          metrics[`${tier.prefix}WinEasyOpPct`] = counts.winEasyOpPct;
+          metrics[`${tier.prefix}WinNormalOpPct`] = counts.winNormalOpPct;
+          metrics[`${tier.prefix}WinHardOpPct`] = counts.winHardOpPct;
           row.metrics = { ...metrics };
           updateRowDom(i);
           workDone += 1;
