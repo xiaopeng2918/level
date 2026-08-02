@@ -496,6 +496,83 @@ function actionKey(action) {
   return `m:${action.fromShelf}:${action.fromSlot}:${action.toShelf}:${action.toSlot}:${action.id}`;
 }
 
+/** Cap for cross-board greedy rank cache (fork / multi-trial). */
+const RANK_CACHE_MAX = 32768;
+
+function enabledOpsCacheKey(ops) {
+  let bits = "";
+  for (const op of SIM_OP_DEFS) bits += ops?.[op.id] ? "1" : "0";
+  return bits;
+}
+
+function rankCacheKey(boardHash, enabledOps, topK) {
+  return `${boardHash}|${enabledOpsCacheKey(enabledOps)}|t${topK}`;
+}
+
+function copyRankAction(action) {
+  if (!action) return action;
+  if (action.type === "plan") {
+    const plan =
+      action.planKind === "dig" ? copyDigPlan(action) : copySetupPlan(action);
+    plan.moves = (action.moves || []).map((m) => ({ ...m }));
+    if (Array.isArray(action.clearShelves)) plan.clearShelves = [...action.clearShelves];
+    if (Array.isArray(action.matchIds)) plan.matchIds = [...action.matchIds];
+    if (Array.isArray(action.revealTypes)) plan.revealTypes = [...action.revealTypes];
+    if (action._scored) {
+      plan._scored = {
+        score: action._scored.score,
+        reason: action._scored.reason,
+        parts: [...(action._scored.parts || [])],
+        deadly: action._scored.deadly,
+      };
+    }
+    return plan;
+  }
+  return { ...action };
+}
+
+function copyRankEntry(entry) {
+  return {
+    score: entry.score,
+    reason: entry.reason,
+    parts: entry.parts ? [...entry.parts] : [],
+    deadly: entry.deadly,
+    action: copyRankAction(entry.action),
+  };
+}
+
+/** @returns {{ chosen, ranked, pickFrom, actionCount }|null} */
+function loadRankCache(searchCache, key, random) {
+  const map = searchCache?.rank;
+  if (!map || !key || !map.has(key)) return null;
+  const hit = map.get(key);
+  // LRU touch
+  map.delete(key);
+  map.set(key, hit);
+  const pickFrom = hit.pickFrom.map(copyRankEntry);
+  const ranked = hit.ranked.map(copyRankEntry);
+  const chosen = pickFrom.length
+    ? pickRandom(
+        pickFrom.map((s) => s.action),
+        random,
+      )
+    : null;
+  return { chosen, ranked, pickFrom, actionCount: hit.actionCount ?? 0 };
+}
+
+function storeRankCache(searchCache, key, pickFrom, ranked, actionCount) {
+  const map = searchCache?.rank;
+  if (!map || !key) return;
+  while (map.size >= RANK_CACHE_MAX) {
+    map.delete(map.keys().next().value);
+  }
+  map.set(key, {
+    pickFrom: pickFrom.map(copyRankEntry),
+    ranked: ranked.map(copyRankEntry),
+    actionCount,
+  });
+}
+
 function copySetupPlan(plan) {
   return {
     type: "plan",
@@ -1392,6 +1469,13 @@ function rankGreedyActions(
   searchCache = null,
   boardHash = null,
 ) {
+  const bh = boardHash || (searchCache?.rank ? hashShelves(shelves) : null);
+  const rKey = searchCache?.rank && bh ? rankCacheKey(bh, enabledOps, topK) : null;
+  if (rKey) {
+    const cached = loadRankCache(searchCache, rKey, random);
+    if (cached) return cached;
+  }
+
   // Same-step score cache: identical actions must not be re-simulated.
   const scoreCache = new Map();
   const scoreCached = (action) => {
@@ -1414,7 +1498,8 @@ function rankGreedyActions(
       ...scoreCached(action),
     }));
     const chosen = pickRandom(specials, random);
-    return { chosen, ranked, pickFrom };
+    storeRankCache(searchCache, rKey, pickFrom, ranked, actions.length);
+    return { chosen, ranked, pickFrom, actionCount: actions.length };
   }
 
   const scarce = isRevealScarce(shelves);
@@ -1512,7 +1597,8 @@ function rankGreedyActions(
   }
 
   if (!scored.length) {
-    return { chosen: null, ranked: [], pickFrom: [] };
+    storeRankCache(searchCache, rKey, [], [], actions.length);
+    return { chosen: null, ranked: [], pickFrom: [], actionCount: actions.length };
   }
 
   const best = scored[0]?.score ?? -Infinity;
@@ -1531,8 +1617,10 @@ function rankGreedyActions(
     pickFrom.map((s) => s.action),
     random,
   );
+  const ranked = scored.slice(0, topK);
+  storeRankCache(searchCache, rKey, pickFrom, ranked, actions.length);
 
-  return { chosen, ranked: scored.slice(0, topK), pickFrom };
+  return { chosen, ranked, pickFrom, actionCount: actions.length };
 }
 
 export function playout(rawLevel, options = {}) {
@@ -1542,6 +1630,7 @@ export function playout(rawLevel, options = {}) {
   const wantTrace = Boolean(options.trace);
   const topK = options.topK ?? 5;
   const enabledOps = normalizeEnabledOps(options.enabledOps);
+  const searchCache = options.searchCache ?? null;
 
   const state = createState(rawLevel);
   const shelves = state.shelves;
@@ -1712,7 +1801,15 @@ export function playout(rawLevel, options = {}) {
       continue;
     }
 
-    const ranking = rankGreedyActions(shelves, actions, random, topK, enabledOps);
+    const ranking = rankGreedyActions(
+      shelves,
+      actions,
+      random,
+      topK,
+      enabledOps,
+      searchCache,
+      hashShelves(shelves),
+    );
     chosen = ranking.chosen;
     ranked = ranking.ranked;
 
@@ -1999,6 +2096,8 @@ export function hydrateForkLeafTrace(rawLevel, leaf, options = {}) {
 
 /**
  * Single-start tree: at each step fork all top-score pickFrom actions (capped).
+ * Expansion is FIFO BFS — spread across shallow ties evenly (not best-first),
+ * so the sample is less clustered around the first win lineage.
  * @returns {{ results: object[], truncated: boolean, exploredLeaves: number }}
  */
 export function analyzeForkTree(rawLevel, options = {}) {
@@ -2014,8 +2113,8 @@ export function analyzeForkTree(rawLevel, options = {}) {
   const frontier = [root];
   const leaves = [];
   let truncated = false;
-  // Transposition cache for expensive setup/dig searches across reconverging boards.
-  const searchCache = { setup: new Map(), dig: new Map() };
+  // Transposition caches: setup/dig plan search + full greedy rank across boards.
+  const searchCache = { setup: new Map(), dig: new Map(), rank: new Map() };
 
   while (frontier.length && leaves.length < maxBranches) {
     const node = frontier.shift();
@@ -2023,8 +2122,7 @@ export function analyzeForkTree(rawLevel, options = {}) {
       leaves.push(finishForkLeaf(node, "win", itemsStart, leaves.length, enabledOps));
       continue;
     }
-    const actions = listActions(node.shelves);
-    if (isBoardFailed(node.shelves) || actions.length === 0) {
+    if (isBoardFailed(node.shelves)) {
       leaves.push(finishForkLeaf(node, "deadlock", itemsStart, leaves.length, enabledOps));
       continue;
     }
@@ -2037,15 +2135,31 @@ export function analyzeForkTree(rawLevel, options = {}) {
       continue;
     }
 
-    const ranking = rankGreedyActions(
-      node.shelves,
-      actions,
-      random,
-      topK,
-      enabledOps,
-      searchCache,
-      node.boardHash,
-    );
+    // Cross-board rank hit: skip listActions + setup/dig search entirely.
+    const rKey = rankCacheKey(node.boardHash, enabledOps, topK);
+    let ranking = loadRankCache(searchCache, rKey, random);
+    let candidates = ranking?.actionCount ?? 0;
+    if (!ranking) {
+      const actions = listActions(node.shelves);
+      if (actions.length === 0) {
+        leaves.push(finishForkLeaf(node, "deadlock", itemsStart, leaves.length, enabledOps));
+        continue;
+      }
+      ranking = rankGreedyActions(
+        node.shelves,
+        actions,
+        random,
+        topK,
+        enabledOps,
+        searchCache,
+        node.boardHash,
+      );
+      candidates = actions.length;
+    } else if (candidates === 0 && !ranking.pickFrom?.length) {
+      leaves.push(finishForkLeaf(node, "deadlock", itemsStart, leaves.length, enabledOps));
+      continue;
+    }
+
     let pickFrom = ranking.pickFrom?.length
       ? ranking.pickFrom
       : ranking.chosen
@@ -2078,7 +2192,7 @@ export function analyzeForkTree(rawLevel, options = {}) {
         entry,
         ranking.ranked,
         null,
-        actions.length,
+        candidates,
         {
           maxMoves,
           itemsStart,
@@ -2104,13 +2218,14 @@ export function analyzeForkTree(rawLevel, options = {}) {
           r,
           ranking.ranked,
           null,
-          actions.length,
+          candidates,
           { maxMoves, itemsStart, forkWidth: 1, choiceIndex: 0 },
         );
         if (rescued) break;
       }
       if (!rescued) {
-        for (const action of actions) {
+        const fallbackActions = listActions(node.shelves);
+        for (const action of fallbackActions) {
           const detail = scoreActionDetailed(node.shelves, action, enabledOps);
           if (!isOpEnabled(enabledOps, detail.reason)) continue;
           rescued = tryApplyForkAction(
@@ -2119,7 +2234,7 @@ export function analyzeForkTree(rawLevel, options = {}) {
             detail,
             ranking.ranked,
             null,
-            actions.length,
+            fallbackActions.length,
             { maxMoves, itemsStart, forkWidth: 1, choiceIndex: 0 },
           );
           if (rescued) break;
@@ -2133,7 +2248,6 @@ export function analyzeForkTree(rawLevel, options = {}) {
     // Prefer expanding fewer children when near branch cap.
     const room = maxBranches - leaves.length;
     if (frontier.length + children.length > room && room > 0) {
-      // Keep expanding but stop accepting new forks beyond cap by converting excess to leaves later.
       truncated = truncated || children.length > 1;
     }
     for (const child of children) {
@@ -2145,7 +2259,7 @@ export function analyzeForkTree(rawLevel, options = {}) {
     }
   }
 
-  // Cap: unfinished frontier nodes become truncated leaves at current position.
+  // Cap: unfinished frontier nodes become truncated leaves (FIFO order).
   while (frontier.length && leaves.length < maxBranches) {
     const node = frontier.shift();
     node.truncatedAt = node.truncatedAt ?? node.logicSteps;
@@ -2157,6 +2271,169 @@ export function analyzeForkTree(rawLevel, options = {}) {
   if (frontier.length) truncated = true;
 
   return { results: leaves, truncated, exploredLeaves: leaves.length, itemsStart };
+}
+
+/**
+ * Slim child for universe counting (no trace / forkPath growth).
+ * Loop detection still walks parent boardHash chain.
+ */
+function applyForkChildCountOnly(node, action, forkMeta) {
+  const snapshot = cloneShelves(node.shelves);
+  const ok = action.type === "plan" ? applyPlan(snapshot, action) : applyAction(snapshot, action);
+  if (!ok) return null;
+  const h = hashShelves(snapshot);
+  if (pathHasBoard(node, h)) return null;
+  const atomicCount = actionHandCount(action);
+  if (node.moves + atomicCount > forkMeta.maxMoves) return null;
+  const itemsLeft = countItems(snapshot);
+  const progress = forkMeta.itemsStart
+    ? (forkMeta.itemsStart - itemsLeft) / forkMeta.itemsStart
+    : 0;
+  const next = {
+    parent: node,
+    boardHash: h,
+    shelves: snapshot,
+    moves: node.moves + atomicCount,
+    logicSteps: node.logicSteps + 1,
+    loops: node.loops,
+    stallSteps: node.stallSteps,
+    bestProgress: node.bestProgress,
+    pathHash: 0,
+    trace: null,
+    forkPath: null,
+    forkPoints: null,
+    truncatedAt: null,
+  };
+  if (progress > next.bestProgress + 1e-9) {
+    next.bestProgress = progress;
+    next.stallSteps = 0;
+  } else {
+    next.stallSteps += 1;
+  }
+  return next;
+}
+
+/**
+ * Count leaves in the full greedy-fork tree (no maxBranches budget).
+ * Exact total needs full expansion — same rules as analyzeForkTree
+ * (pickFrom ties, maxForkWidth, best-first). Caps at leafCap for safety.
+ *
+ * @returns {{ leafCount: number, lowerBound: number, exact: boolean, wins: number, capped: boolean, leafCap: number }}
+ */
+export function countForkUniverse(rawLevel, options = {}) {
+  const maxMoves = options.maxMoves ?? 2500;
+  const maxForkWidth = Math.max(1, options.maxForkWidth ?? 8);
+  const leafCap = Math.max(1, options.leafCap ?? 100000);
+  const enabledOps = normalizeEnabledOps(options.enabledOps);
+  const topK = options.topK ?? 5;
+  const random = rng(options.seed ?? 1);
+
+  const root = makeForkNode(rawLevel, enabledOps);
+  const itemsStart = countItems(root.shelves);
+  const frontier = [root];
+  const searchCache = { setup: new Map(), dig: new Map(), rank: new Map() };
+  let leafCount = 0;
+  let wins = 0;
+  let capped = false;
+
+  while (frontier.length) {
+    if (leafCount >= leafCap) {
+      capped = true;
+      break;
+    }
+    const node = frontier.shift();
+    if (isWon(node.shelves)) {
+      leafCount += 1;
+      wins += 1;
+      continue;
+    }
+    if (isBoardFailed(node.shelves)) {
+      leafCount += 1;
+      continue;
+    }
+    if (node.moves >= maxMoves) {
+      leafCount += 1;
+      continue;
+    }
+    if (node.loops >= 80 || node.stallSteps >= 250) {
+      leafCount += 1;
+      continue;
+    }
+
+    const rKey = rankCacheKey(node.boardHash, enabledOps, topK);
+    let ranking = loadRankCache(searchCache, rKey, random);
+    if (!ranking) {
+      const actions = listActions(node.shelves);
+      if (actions.length === 0) {
+        leafCount += 1;
+        continue;
+      }
+      ranking = rankGreedyActions(
+        node.shelves,
+        actions,
+        random,
+        topK,
+        enabledOps,
+        searchCache,
+        node.boardHash,
+      );
+    } else if ((ranking.actionCount ?? 0) === 0 && !ranking.pickFrom?.length) {
+      leafCount += 1;
+      continue;
+    }
+
+    let pickFrom = ranking.pickFrom?.length
+      ? ranking.pickFrom
+      : ranking.chosen
+        ? [{ action: ranking.chosen }]
+        : [];
+    if (!pickFrom.length) {
+      leafCount += 1;
+      continue;
+    }
+    if (pickFrom.length > maxForkWidth) {
+      pickFrom = pickFrom.slice(0, maxForkWidth);
+    }
+
+    const children = [];
+    for (let i = 0; i < pickFrom.length; i += 1) {
+      const child = applyForkChildCountOnly(node, pickFrom[i].action, {
+        maxMoves,
+        itemsStart,
+      });
+      if (child) children.push(child);
+    }
+    if (!children.length) {
+      let rescued = null;
+      for (const r of ranking.ranked || []) {
+        rescued = applyForkChildCountOnly(node, r.action, { maxMoves, itemsStart });
+        if (rescued) break;
+      }
+      if (!rescued) {
+        for (const action of listActions(node.shelves)) {
+          const detail = scoreActionDetailed(node.shelves, action, enabledOps);
+          if (!isOpEnabled(enabledOps, detail.reason)) continue;
+          rescued = applyForkChildCountOnly(node, action, { maxMoves, itemsStart });
+          if (rescued) break;
+        }
+      }
+      if (rescued) frontier.push(rescued);
+      else leafCount += 1;
+      continue;
+    }
+    for (const child of children) frontier.push(child);
+  }
+
+  if (frontier.length) capped = true;
+  const lowerBound = leafCount + frontier.length;
+  return {
+    leafCount,
+    lowerBound,
+    exact: !capped,
+    wins,
+    capped,
+    leafCap,
+  };
 }
 
 /**
@@ -2236,6 +2513,20 @@ export async function analyzeForkAsync(rawLevel, options = {}) {
   report.summary.winOpMix = aggregateOpSkillMix(winMixes);
   report.summary.winOpMixNote =
     "胜利支路逻辑步中：简单=简单档操作；普通=相对简单多出（翻层可消）；困难=相对普通多出（选架翻层）";
+
+  // Full-universe size: exact only when this run finished without truncation.
+  // Do NOT auto-expand the whole tree here — that is as heavy as simulating all
+  // branches and will freeze the UI/worker on large levels.
+  if (!tree.truncated) {
+    report.summary.fullBranchCount = tree.exploredLeaves;
+    report.summary.fullBranchExact = true;
+    report.summary.fullBranchNote = "当前支路上限已覆盖全部分叉结果";
+  } else {
+    report.summary.fullBranchCount = tree.exploredLeaves;
+    report.summary.fullBranchExact = false;
+    report.summary.fullBranchNote = `已截断：完整宇宙 > ${tree.exploredLeaves}（精确条数需穷尽展开，与模拟全部同级耗时，故不自动测算）`;
+  }
+
   return report;
 }
 
@@ -2377,6 +2668,8 @@ export async function analyzeLevelAsync(rawLevel, options = {}) {
 
   const results = [];
   const startedAt = performance.now();
+  // Share rank/setup/dig caches across trials on the same level.
+  const searchCache = { setup: new Map(), dig: new Map(), rank: new Map() };
 
   for (let i = 0; i < trials; i += 1) {
     const seed = (seed0 + i * 9973) >>> 0;
@@ -2385,6 +2678,7 @@ export async function analyzeLevelAsync(rawLevel, options = {}) {
       maxMoves,
       seed,
       enabledOps,
+      searchCache,
     });
     result.trialIndex = i;
     results.push(result);
@@ -2428,6 +2722,7 @@ export function analyzeLevel(rawLevel, options = {}) {
   const profile = staticProfile(state0.shelves);
 
   const results = [];
+  const searchCache = { setup: new Map(), dig: new Map(), rank: new Map() };
   for (let i = 0; i < trials; i += 1) {
     const seed = (seed0 + i * 9973) >>> 0;
     const result = playout(rawLevel, {
@@ -2435,6 +2730,7 @@ export function analyzeLevel(rawLevel, options = {}) {
       maxMoves,
       seed,
       enabledOps,
+      searchCache,
     });
     result.trialIndex = i;
     results.push(result);

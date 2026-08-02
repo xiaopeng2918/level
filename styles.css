@@ -626,8 +626,9 @@ body.is-dragging .item.movable {
   font-weight: 700;
 }
 
+.fork-strip-head .c-fork-able,
 .fork-strip-head .c-fork {
-  color: #3d4a52;
+  color: #000;
   font-style: normal;
   font-weight: 700;
 }
@@ -701,9 +702,22 @@ body.is-dragging .item.movable {
   background: rgba(100, 110, 118, 0.45);
 }
 
+/* 可分叉：纯黑虚边（结果里未必展开多路） */
+.fork-strip-cell.is-fork-able {
+  border-style: dashed;
+  border-color: #000;
+}
+
+/* 已分叉：纯黑实边（结果集中该前缀下≥2 路） */
 .fork-strip-cell.is-fork {
-  border-color: rgba(20, 28, 34, 0.95);
+  border-style: solid;
+  border-color: #000;
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.35);
+}
+
+.fork-strip-cell.is-fork-able.is-fork {
+  border-style: solid;
+  border-color: #000;
 }
 
 .fork-strip-pad {
@@ -1422,6 +1436,8 @@ body.is-dragging .item.movable {
 .branch-skill-strip-legend .c-easy { color: #2a7a6a; }
 .branch-skill-strip-legend .c-normal { color: #b8860b; }
 .branch-skill-strip-legend .c-hard { color: #c23b3b; }
+.branch-skill-strip-legend .c-fork-able { color: #3d4a52; }
+.branch-skill-strip-legend .c-fork { color: #3d4a52; }
 
 .trace-skill {
   display: inline-block;

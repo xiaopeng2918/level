@@ -10,8 +10,8 @@ import {
   normalizeEnabledOps,
   SIM_OP_PRESETS,
   aggregateOpSkillMix,
-} from "./analyze.js?v=20260803c";
-import { analyzeLevelOffMain, terminateAnalyzeWorker } from "./analyze-client.js?v=20260803c";
+} from "./analyze.js?v=20260803m";
+import { analyzeLevelOffMain, terminateAnalyzeWorker } from "./analyze-client.js?v=20260803m";
 
 function readEnabledOpsFromUi() {
   const ops = defaultEnabledOps();

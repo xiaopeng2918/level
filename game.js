@@ -8,8 +8,8 @@ import {
   SIM_OP_PRESETS,
   defaultEnabledOps,
   normalizeEnabledOps,
-} from "./analyze.js?v=20260803c";
-import { analyzeLevelOffMain } from "./analyze-client.js?v=20260803c";
+} from "./analyze.js?v=20260803m";
+import { analyzeLevelOffMain } from "./analyze-client.js?v=20260803m";
 
 const TRIPLE_WIDTH = 3;
 const SINGLE_WIDTH = 1;
@@ -1438,11 +1438,17 @@ function syncAnalyzeModeUi() {
   }
   if (els.analyzeTrials) {
     els.analyzeTrials.min = fork ? "1" : "10";
-    els.analyzeTrials.max = fork ? "256" : "50000";
+    els.analyzeTrials.max = fork ? "100000" : "50000";
     els.analyzeTrials.step = fork ? "1" : "10";
-    if (fork && Number(els.analyzeTrials.value) > 256) els.analyzeTrials.value = "64";
-    if (fork && Number(els.analyzeTrials.value) < 1) els.analyzeTrials.value = "64";
-    if (!fork && Number(els.analyzeTrials.value) < 10) els.analyzeTrials.value = "120";
+    // 只做范围钳制，不要把自定义值打回默认 64/120（开跑前也会走这里）。
+    const n = Number(els.analyzeTrials.value);
+    if (Number.isFinite(n)) {
+      els.analyzeTrials.value = String(
+        fork
+          ? Math.min(100000, Math.max(1, Math.round(n)))
+          : Math.min(50000, Math.max(10, Math.round(n))),
+      );
+    }
   }
 }
 
@@ -1450,7 +1456,7 @@ function readAnalyzeTrials() {
   const fork = readAnalyzeMode() === "fork";
   const raw = Number(els.analyzeTrials?.value);
   if (!Number.isFinite(raw)) return fork ? 64 : 120;
-  if (fork) return Math.min(256, Math.max(1, Math.round(raw)));
+  if (fork) return Math.min(100000, Math.max(1, Math.round(raw)));
   return Math.min(50000, Math.max(10, Math.round(raw)));
 }
 
@@ -1683,32 +1689,107 @@ const SKILL_STRIP = {
   hardExtra: { cls: "skill-hard", label: "困难" },
 };
 
+/**
+ * Among simulated leaves, which fork steps were actually expanded ≥2 ways
+ * (same path prefix, different choice). Key: `${prefix}|L${step}`.
+ */
+function buildActualForkedStepKeys(results) {
+  const groups = new Map();
+  for (const r of results || []) {
+    const segs = parseForkSegments(r.forkPath);
+    for (let i = 0; i < segs.length; i += 1) {
+      const prefix = segs
+        .slice(0, i)
+        .map((s) => s.key)
+        .join("→");
+      const key = `${prefix}|L${segs[i].step}`;
+      let set = groups.get(key);
+      if (!set) {
+        set = new Set();
+        groups.set(key, set);
+      }
+      set.add(segs[i].choice);
+    }
+  }
+  const out = new Set();
+  for (const [key, set] of groups) {
+    if (set.size > 1) out.add(key);
+  }
+  return out;
+}
+
+function actualForkKeyForStep(forkPath, step) {
+  const segs = parseForkSegments(forkPath);
+  const idx = segs.findIndex((s) => s.step === step);
+  if (idx < 0) return null;
+  const prefix = segs
+    .slice(0, idx)
+    .map((s) => s.key)
+    .join("→");
+  return `${prefix}|L${step}`;
+}
+
+/**
+ * Strip fork markers:
+ * - canFork: 同分可分叉（本步 forkWidth>1），不论结果里是否展开多路
+ * - didFork: 结果集中同一前缀下实际≥2 种选择
+ * Classes: is-fork-able / is-fork（已分叉优先，两者可同时带）
+ */
+function stripForkFlags(step, forkByStep, forkPath, actualForkKeys) {
+  const fp = forkByStep?.get?.(step.step);
+  const canFork = Boolean(fp) || (step.forkWidth != null && step.forkWidth > 1);
+  const forkKey = actualForkKeyForStep(forkPath, step.step);
+  const didFork = forkKey != null && actualForkKeys.has(forkKey);
+  let cls = "";
+  if (canFork) cls += " is-fork-able";
+  if (didFork) cls += " is-fork";
+  return { canFork, didFork, fp, cls };
+}
+
+function stripForkTip(step, skillLabel, reasonLabel, flags) {
+  const { canFork, didFork, fp } = flags;
+  const choice =
+    fp != null ? ` #${(fp.chosenIndex ?? 0) + 1}/${fp.candidates || step.forkWidth || "?"}` : "";
+  if (didFork && canFork) {
+    return `L${step.step} ${skillLabel} · 可分叉且已模拟分叉${choice} · ${reasonLabel}`;
+  }
+  if (didFork) {
+    return `L${step.step} ${skillLabel} · 已模拟分叉${choice} · ${reasonLabel}`;
+  }
+  if (canFork) {
+    return `L${step.step} ${skillLabel} · 可分叉（结果未展开多路）${choice} · ${reasonLabel}`;
+  }
+  return `L${step.step} ${skillLabel} · ${reasonLabel}`;
+}
+
 /** One cell per logic step for the open branch (aligned with the step list). */
-function renderBranchSkillStripHtml(steps, enabledOps) {
+function renderBranchSkillStripHtml(steps, enabledOps, summary = null) {
   const list = steps || [];
   if (!list.length) return "";
+  const actualForkKeys = buildActualForkedStepKeys(analyzeSession.report?.results || []);
+  const forkByStep = new Map((summary?.forkPoints || []).map((p) => [p.step, p]));
   const cells = list
     .map((step) => {
-      const isFork = step.forkWidth != null && step.forkWidth > 1;
+      const flags = stripForkFlags(step, forkByStep, summary?.forkPath, actualForkKeys);
       const skill = classifyOpSkill(step.reason, step.parts, enabledOps);
       const skillMeta = SKILL_STRIP[skill] || { cls: "skill-other", label: "其它" };
       const reasonLabel = REASON_LABEL[step.reason] || step.reason || "";
-      const tip = `L${step.step} ${skillMeta.label} · ${reasonLabel}`;
+      const tip = stripForkTip(step, skillMeta.label, reasonLabel, flags);
       return `<span class="fork-strip-cell branch-strip-cell ${skillMeta.cls}${
-        isFork ? " is-fork" : ""
+        flags.cls
       }" title="${escapeHtml(tip)}"></span>`;
     })
     .join("");
   return `<div class="branch-skill-strip" title="与下方步骤一一对应">
     <span class="branch-skill-strip-label">本支路</span>
     <span class="branch-skill-strip-track">${cells}</span>
-    <span class="branch-skill-strip-legend"><em class="c-easy">简单</em> <em class="c-normal">普通</em> <em class="c-hard">困难</em></span>
+    <span class="branch-skill-strip-legend"><em class="c-easy">简单</em> <em class="c-normal">普通</em> <em class="c-hard">困难</em> · <em class="c-fork-able">黑虚边=可分叉</em> · <em class="c-fork">黑实边=已分叉</em></span>
   </div>`;
 }
 
 /**
  * Minimal strip overview: one row per branch, cells = logic steps.
- * Fill = 简单/普通/困难；描边加粗 = 同分分叉。点击行打开该支路。
+ * Fill = 简单/普通/困难；虚边=可分叉；实粗边=结果里实际分叉过。
  */
 function renderForkStripHtml(results) {
   const sorted = [...results].sort(
@@ -1717,6 +1798,7 @@ function renderForkStripHtml(results) {
   const maxSteps = Math.max(1, ...sorted.map((r) => (r.trace || []).length));
   const selected = analyzeSession.selectedIndex;
   const enabledOps = normalizeEnabledOps(analyzeSession.report?.config?.enabledOps);
+  const actualForkKeys = buildActualForkedStepKeys(sorted);
 
   const rows = sorted
     .map((r) => {
@@ -1726,18 +1808,12 @@ function renderForkStripHtml(results) {
       const { death, fullPath } = forkLeafMeta(r);
       const cells = steps
         .map((step) => {
-          const isFork =
-            forkByStep.has(step.step) || (step.forkWidth != null && step.forkWidth > 1);
-          const fp = forkByStep.get(step.step);
+          const flags = stripForkFlags(step, forkByStep, r.forkPath, actualForkKeys);
           const skill = classifyOpSkill(step.reason, step.parts, enabledOps);
           const skillMeta = SKILL_STRIP[skill] || { cls: "skill-other", label: "其它" };
           const reasonLabel = REASON_LABEL[step.reason] || step.reason || "";
-          const tip = isFork
-            ? `L${step.step} ${skillMeta.label} · 同分分叉×${fp?.candidates || step.forkWidth || "?"}${
-                fp != null ? ` #${(fp.chosenIndex ?? 0) + 1}/${fp.candidates}` : ""
-              } · ${reasonLabel}`
-            : `L${step.step} ${skillMeta.label} · ${reasonLabel}`;
-          return `<span class="fork-strip-cell ${skillMeta.cls}${isFork ? " is-fork" : ""}" title="${escapeHtml(tip)}"></span>`;
+          const tip = stripForkTip(step, skillMeta.label, reasonLabel, flags);
+          return `<span class="fork-strip-cell ${skillMeta.cls}${flags.cls}" title="${escapeHtml(tip)}"></span>`;
         })
         .join("");
       const pad =
@@ -1755,7 +1831,7 @@ function renderForkStripHtml(results) {
   return `<div class="fork-strip-wrap">
     <div class="fork-strip-head">
       <strong>支路缩略</strong>
-      <span>一行一支路 · <em class="c-easy">简单</em> / <em class="c-normal">普通</em> / <em class="c-hard">困难</em> · <em class="c-fork">粗边=分叉</em> · 点击行查看</span>
+      <span>一行一支路 · <em class="c-easy">简单</em> / <em class="c-normal">普通</em> / <em class="c-hard">困难</em> · <em class="c-fork-able">黑虚边=可分叉</em> · <em class="c-fork">黑实边=已分叉</em>（结果≥2路） · 点击行查看</span>
     </div>
     <div class="fork-strip-scroll">${rows}</div>
   </div>`;
@@ -1887,7 +1963,7 @@ function renderTrialListOnly() {
     listEl.innerHTML = rows.length
       ? renderForkTreeHtml(rows)
       : `<p class="trial-empty">当前筛选下无支路</p>`;
-    pagerEl.innerHTML = `<span class="fork-tree-pager-hint">上方缩略：青绿=简单 · 琥珀=普通 · 红=困难 · 粗边=分叉；下方树：绿=唯一最优 · 橙=分叉。点缩略行或叶子看 trace</span>`;
+    pagerEl.innerHTML = `<span class="fork-tree-pager-hint">上方缩略：青绿=简单 · 琥珀=普通 · 红=困难 · 黑虚边=可分叉 · 黑实边=已分叉（结果≥2路）。点缩略行或叶子看 trace</span>`;
     return;
   }
 
@@ -1937,6 +2013,12 @@ function renderAnalyzeReport(report) {
         s.truncated ? "（已截断）" : ""
       } · 宽≤${report.config.maxForkWidth ?? 8} · ${enabledOpsSummary(normalizeEnabledOps(report.config.enabledOps))}`
     : `贪心 · ${report.config.trials} 局 · 仅移动 · ${enabledOpsSummary(normalizeEnabledOps(report.config.enabledOps))}`;
+  const fullBranchLine =
+    fork && s.fullBranchCount != null
+      ? `<li title="${escapeHtml(s.fullBranchNote || "")}">完整分叉宇宙 <strong>${
+          s.fullBranchExact ? s.fullBranchCount : `> ${s.fullBranchCount}`
+        }</strong>${s.fullBranchExact ? " 条" : "（已截断，未穷尽测算）"}</li>`
+      : "";
   const rateNote = fork
     ? `<p class="analyze-profile">分叉支路样本比例（非蒙特卡洛局数）${
         s.truncated ? "；同分宽度或支路上限导致截断" : ""
@@ -1956,6 +2038,7 @@ function renderAnalyzeReport(report) {
       <li>卡死时平均进度 <strong>${pct(s.avgDeadlockProgress)}</strong></li>
       <li>半程前卡死 <strong>${pct(s.earlyStuckRate)}</strong></li>
         <li>通关中位步数 <strong>${s.p50WinMoves || "—"}</strong>（P90 ${s.p90WinMoves || "—"}，按实际移动）</li>
+      ${fullBranchLine}
       ${
         fork && s.winOpMix && s.winOpMix.total
           ? `<li title="${escapeHtml(s.winOpMixNote || "")}">胜利支路操作占比 · 简单 <strong>${s.winOpMix.easyPct}%</strong> · 普通多出 <strong>${s.winOpMix.normalExtraPct}%</strong> · 困难多出 <strong>${s.winOpMix.hardExtraPct}%</strong>（共 ${s.winOpMix.total} 步）</li>`
@@ -2105,7 +2188,7 @@ function renderTraceDetail(summary, traced) {
         ? `<p class="trial-detail-hint">本支路操作占比（逻辑步）：简单 <strong>${summary.opMix.easyPct}%</strong>（${summary.opMix.easyCount}）· 普通多出 <strong>${summary.opMix.normalExtraPct}%</strong>（${summary.opMix.normalExtraCount}）· 困难多出 <strong>${summary.opMix.hardExtraPct}%</strong>（${summary.opMix.hardExtraCount}）</p>`
         : ""
     }
-    ${fork ? renderBranchSkillStripHtml(steps, enabledOps) : ""}
+    ${fork ? renderBranchSkillStripHtml(steps, enabledOps, summary) : ""}
     <div class="trace-list">${stepHtml || "<p>无步骤记录</p>"}</div>
   `;
   detailEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -2527,7 +2610,7 @@ async function runDifficultyAnalysis() {
 
     if (!report?.results?.length) {
       // Fallback if an old worker still stripped results.
-      const { analyzeForkAsync } = await import("./analyze.js?v=20260803c");
+      const { analyzeForkAsync } = await import("./analyze.js?v=20260803m");
       const full =
         mode === "fork"
           ? await analyzeForkAsync(raw, {

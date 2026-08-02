@@ -1,7 +1,7 @@
 /**
  * Off-main-thread Monte Carlo / fork analysis for batch (and any UI caller).
  */
-import { analyzeLevelAsync, analyzeForkAsync } from "./analyze.js?v=20260803c";
+import { analyzeLevelAsync, analyzeForkAsync } from "./analyze.js?v=20260803m";
 
 function slimReport(report) {
   if (!report) return report;
