@@ -9,6 +9,8 @@ import {
   countItems,
   countLayers,
   listActions,
+  listActionsFromShelf,
+  hasLegalAction,
   applyAction,
   isWon,
   isBoardFailed,
@@ -383,10 +385,41 @@ function actionKey(action) {
   return `m:${action.fromShelf}:${action.fromSlot}:${action.toShelf}:${action.toSlot}:${action.id}`;
 }
 
+function copySetupPlan(plan) {
+  return {
+    type: "plan",
+    planKind: "setup3",
+    moves: plan.moves,
+    matchType: plan.matchType,
+    atomicCount: plan.atomicCount,
+    clearShelves: plan.clearShelves,
+    _outcome: plan._outcome
+      ? {
+          reveals: plan._outcome.reveals,
+          matchIds: plan._outcome.matchIds,
+          revealBonus: plan._outcome.revealBonus,
+          revealParts: plan._outcome.revealParts,
+          empties: plan._outcome.empties,
+          actionsLeft: plan._outcome.actionsLeft,
+          won: plan._outcome.won,
+        }
+      : undefined,
+  };
+}
+
 /** Macro plans: 2..maxLen atomic moves that eliminate a front-visible triple.
  *  When setupReveal is on, prefers clearing on shelves whose lower layer helps next.
+ *  @param {Map|null} [searchCache] optional raw-plan cache (fork transposition)
+ *  @param {string|null} [boardHash] hashShelves(shelves) when already known
  */
-function findFrontMatchPlans(shelves, maxLen = 4, enabledOps = null, random = null) {
+function findFrontMatchPlans(
+  shelves,
+  maxLen = 4,
+  enabledOps = null,
+  random = null,
+  searchCache = null,
+  boardHash = null,
+) {
   const typeSet = frontTripleTypes(shelves);
   if (!typeSet.size) return [];
   const useRevealPick = wantsSetupReveal(enabledOps);
@@ -395,7 +428,6 @@ function findFrontMatchPlans(shelves, maxLen = 4, enabledOps = null, random = nu
   const pickClearShelf = useRevealPick || scarce;
   const effectiveMax = scarce ? Math.max(maxLen, 6) : maxLen;
 
-  const plans = [];
   // Keep branching modest — this runs every logic step. Scarce: deeper / wider for 选层.
   const branchAt = scarce
     ? [12, 10, 8, 6, 5, 4]
@@ -403,66 +435,82 @@ function findFrontMatchPlans(shelves, maxLen = 4, enabledOps = null, random = nu
       ? [10, 8, 6, 5]
       : [8, 6, 5, 4];
   const planCap = scarce ? 48 : pickClearShelf ? 24 : 12;
+  const cacheKey = searchCache
+    ? `${boardHash || hashShelves(shelves)}|s${effectiveMax}|${pickClearShelf ? 1 : 0}|${scarce ? 1 : 0}`
+    : null;
 
-  function clearShelvesOf(before, after) {
-    const out = [];
-    for (let i = 0; i < before.length; i += 1) {
-      if ((before[i]?.layers?.length || 0) > (after[i]?.layers?.length || 0)) out.push(i);
-    }
-    return out;
-  }
+  let plans;
+  if (cacheKey && searchCache.has(cacheKey)) {
+    plans = searchCache.get(cacheKey).map(copySetupPlan);
+  } else {
+    plans = [];
 
-  function dfs(state, path, preferShelf = -1, localCap = planCap) {
-    if (plans.length >= localCap) return;
-    if (path.length >= effectiveMax) return;
-    const depth = path.length;
-    const ranked = listActions(state)
-      .map((a) => ({
-        a,
-        s: quickFrontSetupScore(state, a, typeSet, pickClearShelf, scarce, preferShelf),
-      }))
-      .sort((x, y) => y.s - x.s)
-      .slice(0, branchAt[depth] ?? 4);
-
-    for (const { a } of ranked) {
-      if (plans.length >= localCap) break;
-      const next = cloneShelves(state);
-      if (!applyAction(next, a)) continue;
-      const newPath = path.concat([a]);
-      const got = matchedTypeId(shelves, next, typeSet);
-      if (got != null) {
-        if (newPath.length >= 2) {
-          const clearShelves = clearShelvesOf(shelves, next);
-          // Seeded runs only keep plans that actually clear the preferred shelf.
-          if (preferShelf >= 0 && !clearShelves.includes(preferShelf)) {
-            continue;
-          }
-          plans.push({
-            type: "plan",
-            planKind: "setup3",
-            moves: newPath,
-            matchType: got,
-            atomicCount: newPath.length,
-            clearShelves,
-          });
-        }
-        continue;
+    function clearShelvesOf(before, after) {
+      const out = [];
+      for (let i = 0; i < before.length; i += 1) {
+        if ((before[i]?.layers?.length || 0) > (after[i]?.layers?.length || 0)) out.push(i);
       }
-      if (newPath.length < effectiveMax) dfs(next, newPath, preferShelf, localCap);
+      return out;
     }
-  }
 
-  // Scarce/选架: seed high-value clear shelves FIRST so planCap is not filled by easy 架0 paths.
-  if (pickClearShelf) {
-    const seeds = promisingClearShelves(shelves, typeSet, scarce ? 5 : 3);
-    const perSeed = scarce ? 8 : 5;
-    for (const row of seeds) {
-      if (plans.length >= planCap) break;
-      const seedCap = Math.min(planCap, plans.length + perSeed);
-      dfs(shelves, [], row.shelf, seedCap);
+    function dfs(state, path, preferShelf = -1, localCap = planCap) {
+      if (plans.length >= localCap) return;
+      if (path.length >= effectiveMax) return;
+      const depth = path.length;
+      const ranked = listActions(state)
+        .map((a) => ({
+          a,
+          s: quickFrontSetupScore(state, a, typeSet, pickClearShelf, scarce, preferShelf),
+        }))
+        .sort((x, y) => y.s - x.s)
+        .slice(0, branchAt[depth] ?? 4);
+
+      for (const { a } of ranked) {
+        if (plans.length >= localCap) break;
+        const next = cloneShelves(state);
+        if (!applyAction(next, a)) continue;
+        const newPath = path.concat([a]);
+        const got = matchedTypeId(shelves, next, typeSet);
+        if (got != null) {
+          if (newPath.length >= 2) {
+            const clearShelves = clearShelvesOf(shelves, next);
+            // Seeded runs only keep plans that actually clear the preferred shelf.
+            if (preferShelf >= 0 && !clearShelves.includes(preferShelf)) {
+              continue;
+            }
+            plans.push({
+              type: "plan",
+              planKind: "setup3",
+              moves: newPath,
+              matchType: got,
+              atomicCount: newPath.length,
+              clearShelves,
+              // Avoid re-simulating the same plan in scorePlan.
+              _outcome: capturePlanOutcome(shelves, next, { needRevealQuality: scarce }),
+            });
+          }
+          continue;
+        }
+        if (newPath.length < effectiveMax) dfs(next, newPath, preferShelf, localCap);
+      }
+    }
+
+    // Scarce/选架: seed high-value clear shelves FIRST so planCap is not filled by easy 架0 paths.
+    if (pickClearShelf) {
+      const seeds = promisingClearShelves(shelves, typeSet, scarce ? 5 : 3);
+      const perSeed = scarce ? 8 : 5;
+      for (const row of seeds) {
+        if (plans.length >= planCap) break;
+        const seedCap = Math.min(planCap, plans.length + perSeed);
+        dfs(shelves, [], row.shelf, seedCap);
+      }
+    }
+    dfs(shelves, [], -1, planCap);
+
+    if (cacheKey) {
+      searchCache.set(cacheKey, plans.map(copySetupPlan));
     }
   }
-  dfs(shelves, [], -1, planCap);
 
   // Shuffle so each match-type group keeps a random hand-count variant (手数不计分).
   if (random && plans.length > 1) {
@@ -621,20 +669,34 @@ function scoreRevealQuality(before, after, reveals) {
   return { bonus, parts, matchIds };
 }
 
-function evaluatePlanOutcome(before, plan) {
-  const after = cloneShelves(before);
-  if (!applyPlan(after, plan)) return null;
+/** Snapshot outcome after a plan without keeping the full board (cheaper deadly check). */
+function capturePlanOutcome(before, after, { needRevealQuality = true } = {}) {
   const reveals = detectReveals(before, after);
-  const quality = scoreRevealQuality(before, after, reveals);
+  const quality = needRevealQuality
+    ? scoreRevealQuality(before, after, reveals)
+    : { bonus: 0, parts: [], matchIds: [] };
   return {
-    after,
     reveals,
     matchIds: quality.matchIds,
     revealBonus: quality.bonus,
     revealParts: quality.parts,
     empties: countPlaceableEmpties(after),
-    actionsLeft: listActions(after).length,
+    actionsLeft: hasLegalAction(after) ? 1 : 0,
+    won: isWon(after),
   };
+}
+
+function evaluatePlanOutcome(before, plan, opts = {}) {
+  if (plan?._outcome) {
+    const cached = plan._outcome;
+    delete plan._outcome;
+    return cached;
+  }
+  const after = cloneShelves(before);
+  if (!applyPlan(after, plan)) return null;
+  const needRevealQuality = opts.needRevealQuality !== false;
+  const captured = capturePlanOutcome(before, after, { needRevealQuality });
+  return { ...captured, after };
 }
 
 function scorePlan(plan, shelves = null, enabledOps = null) {
@@ -655,10 +717,11 @@ function scorePlan(plan, shelves = null, enabledOps = null) {
   let deadly = false;
 
   if (shelves) {
-    const ev = evaluatePlanOutcome(shelves, plan);
+    const ev = evaluatePlanOutcome(shelves, plan, { needRevealQuality: scarce });
     if (!ev) {
       return { score: -1e9, reason: "setup3", parts: ["计划不可用"], deadly: true };
     }
+    const won = ev.won ?? (ev.after ? isWon(ev.after) : false);
     if (scarce) {
       if (ev.revealBonus > 0) {
         score += ev.revealBonus;
@@ -671,7 +734,7 @@ function scorePlan(plan, shelves = null, enabledOps = null) {
         score += 40;
         parts.push("顺带翻层+40");
       }
-      if (!isWon(ev.after) && ev.empties === 0) {
+      if (!won && ev.empties === 0) {
         score -= 600;
         parts.push("消后无空格-600");
       } else if (ev.empties > 0) {
@@ -679,7 +742,7 @@ function scorePlan(plan, shelves = null, enabledOps = null) {
         parts.push(`留空位+${Math.min(60, ev.empties * 8)}`);
       }
     }
-    if (isWon(ev.after)) {
+    if (won) {
       score += 500;
       parts.push("通关+500");
     } else if (ev.actionsLeft === 0) {
@@ -791,21 +854,46 @@ function scoreDigStep(state, action) {
  * Search per diggable shelf so true 翻层可消 is not crowded out by variants of
  * the first reveal-only dig.
  */
-function findDigRevealPlans(shelves, maxLen = 4) {
+function copyDigPlan(plan) {
+  return {
+    type: "plan",
+    planKind: "dig",
+    moves: plan.moves,
+    atomicCount: plan.atomicCount,
+    reveals: plan.reveals,
+    canMatchPrior: plan.canMatchPrior,
+    matchIds: plan.matchIds,
+    revealShelf: plan.revealShelf,
+    revealTypes: plan.revealTypes,
+    _outcome: plan._outcome
+      ? {
+          reveals: plan._outcome.reveals,
+          matchIds: plan._outcome.matchIds,
+          revealBonus: plan._outcome.revealBonus,
+          revealParts: plan._outcome.revealParts,
+          empties: plan._outcome.empties,
+          actionsLeft: plan._outcome.actionsLeft,
+          won: plan._outcome.won,
+        }
+      : undefined,
+  };
+}
+
+function findDigRevealPlans(shelves, maxLen = 4, searchCache = null, boardHash = null) {
   if (!shelves.some((s) => hasContentBehind(s))) return [];
+
+  const cacheKey = searchCache
+    ? `${boardHash || hashShelves(shelves)}|d${maxLen}`
+    : null;
+  if (cacheKey && searchCache.has(cacheKey)) {
+    return searchCache.get(cacheKey).map(copyDigPlan);
+  }
 
   const plans = [];
 
   function actionsClearingShelf(state, shelfIndex) {
-    return listActions(state).filter((a) => {
-      if (a.type === "special") {
-        return a.shelf === shelfIndex && hasContentBehind(state[a.shelf]);
-      }
-      if (a.type === "move") {
-        return a.fromShelf === shelfIndex && hasContentBehind(state[a.fromShelf]);
-      }
-      return false;
-    });
+    if (!hasContentBehind(state[shelfIndex])) return [];
+    return listActionsFromShelf(state, shelfIndex);
   }
 
   function searchClearShelf(targetShelf) {
@@ -839,6 +927,7 @@ function findDigRevealPlans(shelves, maxLen = 4) {
             matchIds,
             revealShelf: targetShelf,
             revealTypes: [...new Set(reveals.flatMap((r) => r.revealedIds))],
+            _outcome: capturePlanOutcome(shelves, next, { needRevealQuality: true }),
           });
           continue;
         }
@@ -883,7 +972,11 @@ function findDigRevealPlans(shelves, maxLen = 4) {
     });
   const diggable = shelves.filter((s) => hasContentBehind(s)).length;
   const revealCap = Math.max(diggable, 6);
-  return matches.concat(reveals.slice(0, revealCap)).slice(0, 16);
+  const out = matches.concat(reveals.slice(0, revealCap)).slice(0, 16);
+  if (cacheKey) {
+    searchCache.set(cacheKey, out.map(copyDigPlan));
+  }
+  return out;
 }
 
 function scoreDigPlan(plan, shelves = null, enabledOps = null) {
@@ -917,6 +1010,7 @@ function scoreDigPlan(plan, shelves = null, enabledOps = null) {
     }
     const useRevealPick = wantsSetupReveal(enabledOps);
     const scarce = useRevealPick && isRevealScarce(shelves);
+    const won = ev.won ?? (ev.after ? isWon(ev.after) : false);
     if (useRevealPick && ev.revealBonus > 0) {
       score += ev.revealBonus;
       parts.push(...ev.revealParts);
@@ -927,7 +1021,7 @@ function scoreDigPlan(plan, shelves = null, enabledOps = null) {
         parts.push(...adj.parts);
       }
     }
-    if (isWon(ev.after)) {
+    if (won) {
       score += 500;
       parts.push("通关+500");
     } else if (ev.actionsLeft === 0) {
@@ -1049,7 +1143,7 @@ function scoreActionDetailed(shelves, action, enabledOps = null) {
         }
         if (!isWon(snap) && !isMatch3) {
           const emptiesAfterReveal = countPlaceableEmpties(snap);
-          if (listActions(snap).length === 0) {
+          if (!hasLegalAction(snap)) {
             score -= 5000;
             parts.push("翻后无着-5000");
           } else if (emptiesAfterReveal === 0) {
@@ -1065,7 +1159,7 @@ function scoreActionDetailed(shelves, action, enabledOps = null) {
         if (isWon(snap)) {
           score += 500;
           parts.push("通关+500");
-        } else if (listActions(snap).length === 0) {
+        } else if (!hasLegalAction(snap)) {
           score -= 5000;
           parts.push("消后无着-5000");
         }
@@ -1166,7 +1260,15 @@ function applyPlan(shelves, plan) {
   return true;
 }
 
-function rankGreedyActions(shelves, actions, random, topK = 5, enabledOps = defaultEnabledOps()) {
+function rankGreedyActions(
+  shelves,
+  actions,
+  random,
+  topK = 5,
+  enabledOps = defaultEnabledOps(),
+  searchCache = null,
+  boardHash = null,
+) {
   // Same-step score cache: identical actions must not be re-simulated.
   const scoreCache = new Map();
   const scoreCached = (action) => {
@@ -1193,6 +1295,8 @@ function rankGreedyActions(shelves, actions, random, topK = 5, enabledOps = defa
   }
 
   const scarce = isRevealScarce(shelves);
+  const setupCache = searchCache?.setup ?? null;
+  const digCache = searchCache?.dig ?? null;
 
   // Score atomics first. If a 1-hand match3 already exists and exposure is not scarce,
   // skip expensive multi-step setup search — pickFrom will prefer fewer hands anyway.
@@ -1212,7 +1316,7 @@ function rankGreedyActions(shelves, actions, random, topK = 5, enabledOps = defa
   const needSetupSearch = isOpEnabled(enabledOps, "setup3") && (scarce || !hasViableMatch3);
 
   const frontMatchPlans = needSetupSearch
-    ? findFrontMatchPlans(shelves, scarce ? 6 : 4, enabledOps, random)
+    ? findFrontMatchPlans(shelves, scarce ? 6 : 4, enabledOps, random, setupCache, boardHash)
     : [];
   const scoredSetup = frontMatchPlans
     .map((plan) => ({
@@ -1232,7 +1336,7 @@ function rankGreedyActions(shelves, actions, random, topK = 5, enabledOps = defa
     !hasViableSetup &&
     !hasViableMatch3
   ) {
-    digPlans = findDigRevealPlans(shelves, 4).filter((p) => {
+    digPlans = findDigRevealPlans(shelves, 4, digCache, boardHash).filter((p) => {
       const isMatch = Boolean(p.canMatchPrior && p.matchIds?.length);
       // Respect digMatch / digReveal when set; digLayer-only → allow any dig plan.
       if (wantDigMatch || wantDigReveal) {
@@ -1570,7 +1674,10 @@ function actionHandCount(action) {
 
 function makeForkNode(rawLevel, enabledOps) {
   const state = createState(rawLevel);
+  const boardHash = hashShelves(state.shelves);
   return {
+    parent: null,
+    boardHash,
     shelves: state.shelves,
     moves: 0,
     logicSteps: 0,
@@ -1578,7 +1685,6 @@ function makeForkNode(rawLevel, enabledOps) {
     stallSteps: 0,
     bestProgress: 0,
     pathHash: 2166136261 >>> 0,
-    seen: new Set([hashShelves(state.shelves)]),
     trace: [],
     forkPath: [],
     forkPoints: [],
@@ -1586,22 +1692,12 @@ function makeForkNode(rawLevel, enabledOps) {
   };
 }
 
-function cloneForkNode(node) {
-  // Trace steps / fork metadata are append-only; share prior entries across branches.
-  return {
-    shelves: cloneShelves(node.shelves),
-    moves: node.moves,
-    logicSteps: node.logicSteps,
-    loops: node.loops,
-    stallSteps: node.stallSteps,
-    bestProgress: node.bestProgress,
-    pathHash: node.pathHash,
-    seen: new Set(node.seen),
-    trace: node.trace.slice(),
-    forkPath: node.forkPath.slice(),
-    forkPoints: node.forkPoints.slice(),
-    truncatedAt: node.truncatedAt,
-  };
+/** Loop check without copying a growing Set at every fork child. */
+function pathHasBoard(node, boardHash) {
+  for (let n = node; n; n = n.parent) {
+    if (n.boardHash === boardHash) return true;
+  }
+  return false;
 }
 
 function mixPathHash(pathHash, action, logicSteps) {
@@ -1618,16 +1714,33 @@ function tryApplyForkAction(node, action, detail, ranked, _revealBefore, candida
   const ok = action.type === "plan" ? applyPlan(snapshot, action) : applyAction(snapshot, action);
   if (!ok) return null;
   const h = hashShelves(snapshot);
-  if (node.seen.has(h)) return null;
+  if (pathHasBoard(node, h)) return null;
   const atomicCount = actionHandCount(action);
   if (node.moves + atomicCount > forkMeta.maxMoves) return null;
 
-  const next = cloneForkNode(node);
-  next.shelves = snapshot;
-  next.seen.add(h);
-  next.pathHash = mixPathHash(next.pathHash, action, next.logicSteps);
-  next.moves += atomicCount;
-  next.logicSteps += 1;
+  const itemsLeft = countItems(snapshot);
+  const logicSteps = node.logicSteps + 1;
+  const moves = node.moves + atomicCount;
+  const progress = forkMeta.itemsStart
+    ? (forkMeta.itemsStart - itemsLeft) / forkMeta.itemsStart
+    : 0;
+
+  // Trace / forkPath / forkPoints are append-only; slice shares prior entries.
+  const next = {
+    parent: node,
+    boardHash: h,
+    shelves: snapshot,
+    moves,
+    logicSteps,
+    loops: node.loops,
+    stallSteps: node.stallSteps,
+    bestProgress: node.bestProgress,
+    pathHash: mixPathHash(node.pathHash, action, node.logicSteps),
+    trace: node.trace.slice(),
+    forkPath: node.forkPath.slice(),
+    forkPoints: node.forkPoints.slice(),
+    truncatedAt: node.truncatedAt,
+  };
 
   const parts = detail?.parts ? [...detail.parts] : [];
   if (forkMeta.forkWidth > 1) {
@@ -1637,9 +1750,9 @@ function tryApplyForkAction(node, action, detail, ranked, _revealBefore, candida
   // hydrateForkLeafTrace() fills those when the UI opens a branch.
   const chosenKey = actionKey(action);
   next.trace.push({
-    step: next.logicSteps,
+    step: logicSteps,
     atomicCount,
-    movesTotal: next.moves,
+    movesTotal: moves,
     action,
     score: detail?.score ?? 0,
     reason: detail?.reason ?? "move",
@@ -1653,28 +1766,23 @@ function tryApplyForkAction(node, action, detail, ranked, _revealBefore, candida
       selected: actionKey(r.action) === chosenKey,
       action: r.action,
     })),
-    progress: forkMeta.itemsStart
-      ? (forkMeta.itemsStart - countItems(next.shelves)) / forkMeta.itemsStart
-      : 0,
-    itemsLeft: countItems(next.shelves),
+    progress,
+    itemsLeft,
     forkWidth: forkMeta.forkWidth,
   });
 
   if (forkMeta.forkWidth > 1) {
     next.forkPoints.push({
-      step: next.logicSteps,
+      step: logicSteps,
       score: detail?.score ?? 0,
       candidates: forkMeta.forkWidth,
       chosenIndex: forkMeta.choiceIndex,
     });
-    next.forkPath.push(`L${next.logicSteps}#${forkMeta.choiceIndex + 1}/${forkMeta.forkWidth}`);
+    next.forkPath.push(`L${logicSteps}#${forkMeta.choiceIndex + 1}/${forkMeta.forkWidth}`);
   }
 
-  const progressNow = forkMeta.itemsStart
-    ? (forkMeta.itemsStart - countItems(next.shelves)) / forkMeta.itemsStart
-    : 0;
-  if (progressNow > next.bestProgress + 1e-9) {
-    next.bestProgress = progressNow;
+  if (progress > next.bestProgress + 1e-9) {
+    next.bestProgress = progress;
     next.stallSteps = 0;
   } else {
     next.stallSteps += 1;
@@ -1781,6 +1889,8 @@ export function analyzeForkTree(rawLevel, options = {}) {
   const frontier = [root];
   const leaves = [];
   let truncated = false;
+  // Transposition cache for expensive setup/dig searches across reconverging boards.
+  const searchCache = { setup: new Map(), dig: new Map() };
 
   while (frontier.length && leaves.length < maxBranches) {
     const node = frontier.shift();
@@ -1802,7 +1912,15 @@ export function analyzeForkTree(rawLevel, options = {}) {
       continue;
     }
 
-    const ranking = rankGreedyActions(node.shelves, actions, random, topK, enabledOps);
+    const ranking = rankGreedyActions(
+      node.shelves,
+      actions,
+      random,
+      topK,
+      enabledOps,
+      searchCache,
+      node.boardHash,
+    );
     let pickFrom = ranking.pickFrom?.length
       ? ranking.pickFrom
       : ranking.chosen

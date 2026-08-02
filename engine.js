@@ -286,6 +286,91 @@ export function tryMove(shelves, fromShelf, fromSlot, toShelf, toSlot) {
   return true;
 }
 
+function collectMoveEndpoints(shelves) {
+  const sources = [];
+  const targets = [];
+  shelves.forEach((shelf, shelfIndex) => {
+    const layer = frontLayer(shelf);
+    if (layer) {
+      layer.forEach((id, slot) => {
+        if (id !== 0 && !isSpecialClearId(id)) {
+          sources.push({ shelf: shelfIndex, slot, id });
+        }
+      });
+    }
+    if (!canPlaceOnShelf(shelves, shelfIndex)) return;
+    if (!layer) {
+      for (let slot = 0; slot < TRIPLE_WIDTH; slot += 1) {
+        targets.push({ shelf: shelfIndex, slot });
+      }
+      return;
+    }
+    layer.forEach((id, slot) => {
+      if (id === 0) targets.push({ shelf: shelfIndex, slot });
+    });
+  });
+  return { sources, targets };
+}
+
+/** True if at least one legal special or cross-shelf move exists (early-exit). */
+export function hasLegalAction(shelves) {
+  for (let shelfIndex = 0; shelfIndex < shelves.length; shelfIndex += 1) {
+    const layer = frontLayer(shelves[shelfIndex]);
+    if (!layer) continue;
+    for (let slot = 0; slot < layer.length; slot += 1) {
+      if (isSpecialClearId(layer[slot])) return true;
+    }
+  }
+  const { sources, targets } = collectMoveEndpoints(shelves);
+  if (!sources.length || !targets.length) return false;
+  for (const src of sources) {
+    for (const dst of targets) {
+      if (src.shelf !== dst.shelf) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Legal actions that clear cells on one shelf (specials on it + moves from it).
+ * Same set as filtering listActions to that shelf — cheaper for dig DFS.
+ */
+export function listActionsFromShelf(shelves, shelfIndex) {
+  const actions = [];
+  const layer = frontLayer(shelves[shelfIndex]);
+  if (!layer) return actions;
+
+  layer.forEach((id, slot) => {
+    if (isSpecialClearId(id)) {
+      actions.push({ type: "special", shelf: shelfIndex, slot });
+    }
+  });
+
+  const sources = [];
+  layer.forEach((id, slot) => {
+    if (id !== 0 && !isSpecialClearId(id)) {
+      sources.push({ slot, id });
+    }
+  });
+  if (!sources.length) return actions;
+
+  const { targets } = collectMoveEndpoints(shelves);
+  for (const src of sources) {
+    for (const dst of targets) {
+      if (dst.shelf === shelfIndex) continue;
+      actions.push({
+        type: "move",
+        fromShelf: shelfIndex,
+        fromSlot: src.slot,
+        toShelf: dst.shelf,
+        toSlot: dst.slot,
+        id: src.id,
+      });
+    }
+  }
+  return actions;
+}
+
 /**
  * Enumerate legal actions:
  * - { type: 'special', shelf, slot }
@@ -304,33 +389,7 @@ export function listActions(shelves) {
     });
   });
 
-  const sources = [];
-  shelves.forEach((shelf, shelfIndex) => {
-    const layer = frontLayer(shelf);
-    if (!layer) return;
-    layer.forEach((id, slot) => {
-      if (id !== 0 && !isSpecialClearId(id)) {
-        sources.push({ shelf: shelfIndex, slot, id });
-      }
-    });
-  });
-
-  const targets = [];
-  shelves.forEach((shelf, shelfIndex) => {
-    if (!canPlaceOnShelf(shelves, shelfIndex)) return;
-    let layer = frontLayer(shelf);
-    if (!layer) {
-      // virtual empty triple
-      for (let slot = 0; slot < TRIPLE_WIDTH; slot += 1) {
-        targets.push({ shelf: shelfIndex, slot, emptyShelf: true });
-      }
-      return;
-    }
-    layer.forEach((id, slot) => {
-      if (id === 0) targets.push({ shelf: shelfIndex, slot, emptyShelf: false });
-    });
-  });
-
+  const { sources, targets } = collectMoveEndpoints(shelves);
   for (const src of sources) {
     for (const dst of targets) {
       // Same-shelf rearrangement never helps: matches ignore order, empties are fungible.

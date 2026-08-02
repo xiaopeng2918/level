@@ -481,9 +481,17 @@ body.is-dragging .item.movable {
 }
 
 .level-panel {
+  position: relative;
+  z-index: 26; /* above startup overlay so sim-ops stay visible/clickable */
   padding: 16px;
   display: grid;
   gap: 12px;
+}
+
+.sim-ops-fallback {
+  margin: 0;
+  font-size: 0.82rem;
+  color: var(--muted);
 }
 
 .level-panel-head {

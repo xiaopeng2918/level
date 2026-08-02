@@ -1,11 +1,16 @@
 /**
  * Batch-simulate levels from a dragged Excel file.
- * Reads 物品数据 / itemData, runs greedy Monte Carlo, writes metrics back.
- * Heavy simulation runs in a Web Worker so the page stays responsive.
+ * Modes:
+ * - forkTiers: 简单/普通/困难 × N fork branches → 9 columns (win/fail/winRate × 3)
+ * - montecarlo: greedy Monte Carlo with UI-enabled ops
  */
 
-import { defaultEnabledOps, normalizeEnabledOps } from "./analyze.js?v=20260802k";
-import { analyzeLevelOffMain, terminateAnalyzeWorker } from "./analyze-client.js?v=20260802k";
+import {
+  defaultEnabledOps,
+  normalizeEnabledOps,
+  SIM_OP_PRESETS,
+} from "./analyze.js?v=20260802p";
+import { analyzeLevelOffMain, terminateAnalyzeWorker } from "./analyze-client.js?v=20260802p";
 
 function readEnabledOpsFromUi() {
   const ops = defaultEnabledOps();
@@ -15,7 +20,35 @@ function readEnabledOpsFromUi() {
   return normalizeEnabledOps(ops);
 }
 
-const RESULT_FIELDS = [
+/** Three op tiers for fork-compare batch (简单 / 普通 / 困难). */
+const FORK_TIER_DEFS = [
+  { id: "easy", label: "简单", prefix: "easy", zh: "简单" },
+  { id: "normal", label: "普通", prefix: "normal", zh: "普通" },
+  { id: "hard", label: "困难", prefix: "hard", zh: "困难" },
+];
+
+const FORK_TIER_FIELDS = FORK_TIER_DEFS.flatMap((tier) => [
+  {
+    key: `${tier.prefix}WinCount`,
+    zh: `${tier.zh}胜利次数`,
+    en: `${tier.prefix}WinCount`,
+    type: "number",
+  },
+  {
+    key: `${tier.prefix}FailCount`,
+    zh: `${tier.zh}失败次数`,
+    en: `${tier.prefix}FailCount`,
+    type: "number",
+  },
+  {
+    key: `${tier.prefix}WinRate`,
+    zh: `${tier.zh}通关率`,
+    en: `${tier.prefix}WinRate`,
+    type: "number",
+  },
+]);
+
+const MC_RESULT_FIELDS = [
   { key: "simDifficulty", zh: "模拟难度分", en: "simDifficulty", from: (s) => s.difficulty },
   { key: "simTier", zh: "模拟难度档", en: "simTier", from: (s) => s.tier },
   { key: "winRate", zh: "通关率", en: "winRate", from: (s) => pctNum(s.winRate) },
@@ -48,6 +81,42 @@ const RESULT_FIELDS = [
   { key: "structSpecials", zh: "结构特殊数", en: "structSpecials", from: (_s, _b, p) => p.specials },
   { key: "simError", zh: "模拟错误", en: "simError", from: () => "" },
 ];
+
+const FORK_RESULT_FIELDS = [
+  ...FORK_TIER_FIELDS,
+  { key: "simError", zh: "模拟错误", en: "simError", type: "string" },
+];
+
+function readBatchMode() {
+  const v = document.getElementById("batchMode")?.value;
+  return v === "montecarlo" ? "montecarlo" : "forkTiers";
+}
+
+function activeResultFields() {
+  return readBatchMode() === "forkTiers" ? FORK_RESULT_FIELDS : MC_RESULT_FIELDS;
+}
+
+function syncBatchModeUi() {
+  const mode = readBatchMode();
+  const label = document.getElementById("batchTrialsLabelText");
+  const trials = document.getElementById("batchTrials");
+  const hint = document.getElementById("batchModeHint");
+  if (mode === "forkTiers") {
+    if (label) label.textContent = "每档支路数";
+    if (trials && (Number(trials.value) === 20 || !trials.value)) trials.value = "64";
+    if (hint) {
+      hint.textContent =
+        "拖入 Excel（含「物品数据 / itemData」）。三档分叉：简单 / 普通 / 困难各跑 N 条支路，每行额外写回 9 列（胜利次数、失败次数、通关率 × 3 档）。";
+    }
+  } else {
+    if (label) label.textContent = "每关局数";
+    if (trials && Number(trials.value) === 64) trials.value = "20";
+    if (hint) {
+      hint.textContent =
+        "拖入 Excel（含「物品数据 / itemData」）。多局统计：使用上方「模拟可用操作」勾选，结果写回多列指标。";
+    }
+  }
+}
 
 function pctNum(n) {
   if (!Number.isFinite(n)) return "";
@@ -259,7 +328,8 @@ function setStatus(text) {
 
 function readTrials() {
   const n = Number(els.trials?.value);
-  if (!Number.isFinite(n)) return 20;
+  const fallback = readBatchMode() === "forkTiers" ? 64 : 20;
+  if (!Number.isFinite(n)) return fallback;
   return Math.min(500, Math.max(5, Math.round(n)));
 }
 
@@ -268,10 +338,23 @@ function metricsFromReport(report) {
   const b = report.progressBuckets || [];
   const p = report.profile || {};
   const out = {};
-  for (const f of RESULT_FIELDS) {
-    out[f.key] = f.from(s, b, p);
+  for (const f of MC_RESULT_FIELDS) {
+    out[f.key] = f.from ? f.from(s, b, p) : "";
   }
   return out;
+}
+
+/** Count win/fail/rate from a fork (or MC) report's leaf/trial rows. */
+function forkLeafCounts(report) {
+  const results = report?.results || [];
+  const total = results.length;
+  const wins = results.filter((r) => r.result === "win").length;
+  const fails = total - wins;
+  return {
+    winCount: wins,
+    failCount: fails,
+    winRate: pctNum(total ? wins / total : 0),
+  };
 }
 
 function ensureResultColumns() {
@@ -279,17 +362,25 @@ function ensureResultColumns() {
   const keyRow = aoa[layout.keyRow];
   const zhRow = aoa[layout.zhRow] || aoa[0];
   const typeRow = layout.typeRow >= 0 ? aoa[layout.typeRow] : null;
+  const fields = activeResultFields();
 
   const existing = new Map();
   keyRow.forEach((cell, idx) => {
     const s = cellStr(cell);
     if (s) existing.set(s, idx);
+    // Also match Chinese headers already written.
+    const zh = cellStr(zhRow[idx]);
+    if (zh) existing.set(zh, idx);
   });
 
   const colIndex = {};
-  for (const f of RESULT_FIELDS) {
+  for (const f of fields) {
     if (existing.has(f.en)) {
       colIndex[f.key] = existing.get(f.en);
+      continue;
+    }
+    if (existing.has(f.zh)) {
+      colIndex[f.key] = existing.get(f.zh);
       continue;
     }
     const idx = keyRow.length;
@@ -298,11 +389,14 @@ function ensureResultColumns() {
     zhRow[idx] = f.zh;
     if (typeRow) {
       while (typeRow.length < idx) typeRow.push("");
-      typeRow[idx] = f.key === "simTier" || f.key === "simError" ? "string" : "number";
+      const isStr =
+        f.type === "string" || f.key === "simTier" || f.key === "simError";
+      typeRow[idx] = isStr ? "string" : "number";
     }
     colIndex[f.key] = idx;
   }
   state.colIndex = colIndex;
+  state.activeFields = fields;
 }
 
 function buildRowModels() {
@@ -349,18 +443,21 @@ function buildRowModels() {
   state.rows = rows;
 }
 
+function displayFields() {
+  const fields = state.activeFields || activeResultFields();
+  return fields.filter((f) => f.key !== "simError");
+}
+
 function renderTable() {
   if (!els.table) return;
+  const cols = displayFields();
   const head = `
     <thead><tr>
       <th>行</th>
       <th>关卡号</th>
       <th>表索引</th>
       <th>状态</th>
-      ${RESULT_FIELDS.filter((f) => f.key !== "simError")
-        .slice(0, 9)
-        .map((f) => `<th>${f.zh}</th>`)
-        .join("")}
+      ${cols.map((f) => `<th>${f.zh}</th>`).join("")}
       <th>错误</th>
     </tr></thead>`;
 
@@ -377,8 +474,7 @@ function renderTable() {
               : row.status === "skipped"
                 ? "跳过"
                 : "等待";
-      const cells = RESULT_FIELDS.filter((f) => f.key !== "simError")
-        .slice(0, 9)
+      const cells = cols
         .map((f) => `<td data-k="${f.key}">${m[f.key] ?? ""}</td>`)
         .join("");
       return `<tr data-i="${i}" class="batch-row status-${row.status}">
@@ -414,7 +510,7 @@ function updateRowDom(i) {
             : "等待";
   tr.querySelector(".batch-status-cell").textContent = statusLabel;
   tr.querySelector(".batch-error-cell").textContent = row.error || m.simError || "";
-  for (const f of RESULT_FIELDS.filter((x) => x.key !== "simError").slice(0, 9)) {
+  for (const f of displayFields()) {
     const td = tr.querySelector(`td[data-k="${f.key}"]`);
     if (td) td.textContent = m[f.key] ?? "";
   }
@@ -427,7 +523,8 @@ function writeMetricsToAoa(row) {
   const excelRow = state.aoa[row.excelRow];
   const m = row.metrics || {};
   if (row.error) m.simError = row.error;
-  for (const f of RESULT_FIELDS) {
+  const fields = state.activeFields || activeResultFields();
+  for (const f of fields) {
     const col = state.colIndex[f.key];
     if (col == null) continue;
     while (excelRow.length < col) excelRow.push("");
@@ -457,8 +554,32 @@ async function parseFile(file) {
   );
 }
 
+async function runOneForkTier(level, tier, branches, onProgress) {
+  const preset = SIM_OP_PRESETS[tier.id];
+  if (!preset) throw new Error(`未知操作档：${tier.id}`);
+  const report = await analyzeLevelOffMain(level, {
+    mode: "fork",
+    trials: branches,
+    maxBranches: branches,
+    maxForkWidth: 8,
+    strategy: "greedy",
+    maxMoves: 2500,
+    seed: 42,
+    chunkSize: 1,
+    enabledOps: normalizeEnabledOps(preset.ops),
+    slimResults: false,
+    onProgress,
+  });
+  return forkLeafCounts(report);
+}
+
 async function runBatch() {
   if (state.running || !state.rows.length) return;
+  syncBatchModeUi();
+  ensureResultColumns();
+  renderTable();
+
+  const mode = readBatchMode();
   const trials = readTrials();
   if (els.trials) els.trials.value = String(trials);
 
@@ -472,6 +593,9 @@ async function runBatch() {
   const total = state.rows.length;
   const startedAt = performance.now();
   let done = 0;
+  const tierSteps = mode === "forkTiers" ? FORK_TIER_DEFS.length : 1;
+  const workTotal = total * tierSteps;
+  let workDone = 0;
 
   for (let i = 0; i < total; i += 1) {
     if (state.stop) break;
@@ -482,34 +606,82 @@ async function runBatch() {
       writeMetricsToAoa(row);
       updateRowDom(i);
       done += 1;
+      workDone += tierSteps;
       continue;
     }
 
     row.status = "running";
     updateRowDom(i);
-    setStatus(`正在模拟关卡 ${row.levelId}（${i + 1}/${total}）· 每关 ${trials} 局…`);
 
     try {
-      const report = await analyzeLevelOffMain(row.level, {
-        trials,
-        strategy: "greedy",
-        maxMoves: 2500,
-        seed: 42,
-        chunkSize: 2,
-        enabledOps: readEnabledOpsFromUi(),
-        slimResults: true,
-        onProgress: (p) => {
-          if (state.stop) return;
-          const levelPct = p.total ? Math.round((p.done / p.total) * 100) : 0;
+      if (mode === "forkTiers") {
+        const metrics = { ...(row.metrics || {}) };
+        for (let t = 0; t < FORK_TIER_DEFS.length; t += 1) {
+          if (state.stop) break;
+          const tier = FORK_TIER_DEFS[t];
           setStatus(
-            `关卡 ${row.levelId}（${i + 1}/${total}）· 局 ${p.done}/${p.total}（${levelPct}%）· 后台计算中…`,
+            `关卡 ${row.levelId}（${i + 1}/${total}）· ${tier.label}档分叉 ${trials} 支路（${t + 1}/3）…`,
           );
-        },
-      });
-      if (state.stop) break;
-      row.metrics = metricsFromReport(report);
-      row.status = "done";
-      row.error = "";
+          const counts = await runOneForkTier(row.level, tier, trials, (p) => {
+            if (state.stop) return;
+            const levelPct = p.total ? Math.round((p.done / p.total) * 100) : 0;
+            setStatus(
+              `关卡 ${row.levelId}（${i + 1}/${total}）· ${tier.label} · 支路 ${p.done}/${p.total}（${levelPct}%）`,
+            );
+          });
+          if (state.stop) break;
+          metrics[`${tier.prefix}WinCount`] = counts.winCount;
+          metrics[`${tier.prefix}FailCount`] = counts.failCount;
+          metrics[`${tier.prefix}WinRate`] = counts.winRate;
+          row.metrics = { ...metrics };
+          updateRowDom(i);
+          workDone += 1;
+          const elapsed = performance.now() - startedAt;
+          const msPer = elapsed / Math.max(1, workDone);
+          const eta = (workTotal - workDone) * msPer;
+          const pctDone = Math.round((workDone / workTotal) * 1000) / 10;
+          if (els.bar) els.bar.style.width = `${pctDone}%`;
+          setStatus(
+            `进度 ${workDone}/${workTotal} 档次（${pctDone}%）· 关卡 ${row.levelId} 已完成 ${tier.label} · 已用 ${formatDuration(elapsed)} · 预计剩余 ${formatDuration(eta)}`,
+          );
+        }
+        if (state.stop) {
+          row.status = "pending";
+          updateRowDom(i);
+          break;
+        }
+        row.metrics = metrics;
+        row.status = "done";
+        row.error = "";
+      } else {
+        setStatus(`正在模拟关卡 ${row.levelId}（${i + 1}/${total}）· 每关 ${trials} 局…`);
+        const report = await analyzeLevelOffMain(row.level, {
+          mode: "montecarlo",
+          trials,
+          strategy: "greedy",
+          maxMoves: 2500,
+          seed: 42,
+          chunkSize: 2,
+          enabledOps: readEnabledOpsFromUi(),
+          slimResults: true,
+          onProgress: (p) => {
+            if (state.stop) return;
+            const levelPct = p.total ? Math.round((p.done / p.total) * 100) : 0;
+            setStatus(
+              `关卡 ${row.levelId}（${i + 1}/${total}）· 局 ${p.done}/${p.total}（${levelPct}%）· 后台计算中…`,
+            );
+          },
+        });
+        if (state.stop) {
+          row.status = "pending";
+          updateRowDom(i);
+          break;
+        }
+        row.metrics = metricsFromReport(report);
+        row.status = "done";
+        row.error = "";
+        workDone += 1;
+      }
     } catch (err) {
       if (state.stop || err?.message === "cancelled") {
         row.status = "pending";
@@ -520,20 +692,23 @@ async function runBatch() {
       row.error = err.message || String(err);
       row.metrics = row.metrics || {};
       row.metrics.simError = row.error;
+      workDone = Math.min(workTotal, (i + 1) * tierSteps);
     }
 
     writeMetricsToAoa(row);
     updateRowDom(i);
     done += 1;
 
-    const elapsed = performance.now() - startedAt;
-    const msPer = elapsed / done;
-    const eta = (total - done) * msPer;
-    const pctDone = Math.round((done / total) * 1000) / 10;
-    if (els.bar) els.bar.style.width = `${pctDone}%`;
-    setStatus(
-      `进度 ${done}/${total}（${pctDone}%）· 已用 ${formatDuration(elapsed)} · 预计剩余 ${formatDuration(eta)}`,
-    );
+    if (mode !== "forkTiers") {
+      const elapsed = performance.now() - startedAt;
+      const msPer = elapsed / done;
+      const eta = (total - done) * msPer;
+      const pctDone = Math.round((done / total) * 1000) / 10;
+      if (els.bar) els.bar.style.width = `${pctDone}%`;
+      setStatus(
+        `进度 ${done}/${total}（${pctDone}%）· 已用 ${formatDuration(elapsed)} · 预计剩余 ${formatDuration(eta)}`,
+      );
+    }
   }
 
   if (state.stop) terminateAnalyzeWorker();
@@ -543,8 +718,14 @@ async function runBatch() {
   els.btnStop.disabled = true;
   els.btnDownload.disabled = false;
 
-  if (state.stop) setStatus(`已停止：完成 ${done}/${total}。可下载当前结果。`);
-  else setStatus(`全部完成：${total} 关 × ${trials} 局。点击「下载结果表」。`);
+  if (state.stop) setStatus(`已停止：完成 ${done}/${total} 关。可下载当前结果。`);
+  else if (mode === "forkTiers") {
+    setStatus(
+      `全部完成：${total} 关 × 3 档 × ${trials} 支路。已写回 9 列（胜利/失败/通关率）。点击「下载结果表」。`,
+    );
+  } else {
+    setStatus(`全部完成：${total} 关 × ${trials} 局。点击「下载结果表」。`);
+  }
 }
 
 function downloadResult() {
@@ -668,7 +849,16 @@ function bindUi() {
   });
   els.btnDownload?.addEventListener("click", downloadResult);
 
+  document.getElementById("batchMode")?.addEventListener("change", () => {
+    syncBatchModeUi();
+    if (state.aoa && state.layout) {
+      ensureResultColumns();
+      renderTable();
+    }
+  });
+
   window.__BATCH_BOUND__ = true;
+  syncBatchModeUi();
   setStatus("等待上传表格…（上传组件已就绪）");
   loadXlsxLib()
     .then(() => {

@@ -1,9 +1,9 @@
 /**
  * Off-main-thread entry for Monte Carlo / fork analysis (shared by UI + batch).
  */
-import { analyzeLevelAsync, analyzeForkAsync } from "./analyze.js?v=20260802k";
+import { analyzeLevelAsync, analyzeForkAsync } from "./analyze.js?v=20260802p";
 
-const WORKER_VER = "20260802k";
+const WORKER_VER = "20260802p";
 
 let analyzeWorker = null;
 let analyzeReqId = 0;

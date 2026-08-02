@@ -6,8 +6,8 @@ import {
   SIM_OP_PRESETS,
   defaultEnabledOps,
   normalizeEnabledOps,
-} from "./analyze.js?v=20260802k";
-import { analyzeLevelOffMain } from "./analyze-client.js?v=20260802k";
+} from "./analyze.js?v=20260802p";
+import { analyzeLevelOffMain } from "./analyze-client.js?v=20260802p";
 
 const TRIPLE_WIDTH = 3;
 const SINGLE_WIDTH = 1;
@@ -2471,7 +2471,7 @@ async function runDifficultyAnalysis() {
 
     if (!report?.results?.length) {
       // Fallback if an old worker still stripped results.
-      const { analyzeForkAsync } = await import("./analyze.js?v=20260802k");
+      const { analyzeForkAsync } = await import("./analyze.js?v=20260802p");
       const full =
         mode === "fork"
           ? await analyzeForkAsync(raw, {
